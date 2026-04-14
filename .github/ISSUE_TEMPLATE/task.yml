@@ -1,0 +1,48 @@
+name: Task
+description: Technical work linked to a user story
+title: "[Task]: "
+labels: ["task"]
+body:
+  - type: input
+    id: id
+    attributes:
+      label: Task ID
+      description: Unique identifier (e.g. T-1)
+    validations:
+      required: true
+
+  - type: input
+    id: parent
+    attributes:
+      label: Parent User Story
+      description: Link issue number or user story title (e.g. #12 or Set up device)
+    validations:
+      required: true
+
+  - type: input
+    id: priority
+    attributes:
+      label: Priority
+      description: 1 (highest), 2, 3, 4...
+    validations:
+      required: true
+
+  - type: input
+    id: points
+    attributes:
+      label: Estimate
+      description: Fibonacci scale (1,2,3,5,8,13)
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Task Description
+    validations:
+      required: true
+
+  - type: textarea
+    id: done
+    attributes:
+      label: Definition of Done

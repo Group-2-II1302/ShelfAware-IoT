@@ -1,0 +1,37 @@
+name: Bug
+description: Something broken in the system
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: id
+    attributes:
+      label: Bug ID
+      description: e.g. BUG-1
+    validations:
+      required: true
+
+  - type: input
+    id: priority
+    attributes:
+      label: Priority
+      description: 1 (highest), 2, 3, 4...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior

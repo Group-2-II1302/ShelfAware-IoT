@@ -1,0 +1,43 @@
+name: User Story
+description: Product backlog story
+title: "[title]: "
+labels: ["user-story"]
+body:
+  - type: input
+    id: id
+    attributes:
+      label: Story ID
+      description: Unique identifier (e.g. ID-1)
+    validations:
+      required: true
+
+  - type: input
+    id: priority
+    attributes:
+      label: Priority
+      description: 1 (highest), 2, 3, 4...
+    validations:
+      required: true
+
+  - type: input
+    id: points
+    attributes:
+      label: Story Points / Estimate
+      description: Fibonacci scale (1,2,3,5,8,13)
+    validations:
+      required: true
+
+  - type: textarea
+    id: story
+    attributes:
+      label: User Story
+      placeholder: As a ___ I want ___ so that ___
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+    validations:
+      required: true
