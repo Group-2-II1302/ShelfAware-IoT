@@ -118,7 +118,7 @@ JSON UTF-8 to `PROC_A_CONTROL_HOST:PROC_A_CONTROL_PORT`:
 { "type": "wake" }
 ```
 
-Tentative — finalize with Process A's owner. `id` and `expires_at` are not propagated; wake is fire-and-forget over IPC.
+Tentative - finalize with Process A's owner. `id` and `expires_at` are not propagated; wake is fire-and-forget over IPC.
 
 ## Development
 
