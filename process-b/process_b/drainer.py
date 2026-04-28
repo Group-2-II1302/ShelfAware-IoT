@@ -253,15 +253,20 @@ async def _post_group(
     )
 
 
-def _pick_metadata(readings: list[db.Reading]) -> dict[str, object] | None:
+def _pick_metadata(readings: list[db.Reading]) -> dict[str, object]:
     """Pick the most-recent non-null metadata from a shelf's batch.
 
-    Falls back to ``None`` if no reading carries metadata. Ordering by
-    ``sampled_at`` is lexicographic — valid for ISO 8601 UTC strings, which
-    the contract requires.
+    Falls back to an empty dict (``{}``) if no reading carries metadata.
+    The backend's request schema requires ``metadata`` to be a JSON object;
+    sending ``null`` produces a 400 (``Invalid input: expected object,
+    received null``). When Process A doesn't supply battery/rssi we have no
+    real data to send, but we still need a valid object on the wire.
+
+    Ordering by ``sampled_at`` is lexicographic — valid for ISO 8601 UTC
+    strings, which the contract requires.
     """
     candidates = [r for r in readings if r.metadata is not None]
     if not candidates:
-        return None
+        return {}
     chosen = max(candidates, key=lambda r: r.sampled_at)
     return chosen.metadata

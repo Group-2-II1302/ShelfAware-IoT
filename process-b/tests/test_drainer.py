@@ -122,7 +122,10 @@ async def _outbox(conn: aiosqlite.Connection) -> list[db.Reading]:
 
 
 class TestPickMetadata:
-    def test_returns_none_when_all_metadata_are_none(self) -> None:
+    def test_returns_empty_dict_when_all_metadata_are_none(self) -> None:
+        # Backend's Zod schema requires metadata to be an object; null causes
+        # a 400. When no reading carries real metadata, we send {} on the
+        # wire so the request validates as an empty (but well-formed) object.
         readings = [
             db.Reading(
                 reading_id=f"r{i}",
@@ -135,7 +138,7 @@ class TestPickMetadata:
             )
             for i in range(3)
         ]
-        assert _pick_metadata(readings) is None
+        assert _pick_metadata(readings) == {}
 
     def test_picks_most_recent_non_null_metadata(self) -> None:
         readings = [
