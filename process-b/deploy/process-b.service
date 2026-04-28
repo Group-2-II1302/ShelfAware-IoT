@@ -1,0 +1,54 @@
+[Unit]
+Description=ShelfAware Process B (broker/persister daemon)
+Documentation=https://github.com/your-org/ShelfAware-IoT/tree/main/process-b
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/process-b/.venv/bin/process-b
+Restart=on-failure
+RestartSec=5
+
+# Run as a dedicated unprivileged user. Create with:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin process-b
+User=process-b
+Group=process-b
+
+# Every PI_API_KEY / BACKEND_URL / SHELF_IDS / port / interval lives here.
+# See deploy/process-b.env.example for the schema.
+EnvironmentFile=/etc/process-b/process-b.env
+
+# Send SIGTERM on stop; main.py's signal handler triggers graceful shutdown.
+# 20s is generous — clean shutdown takes under a second in practice, but
+# we want headroom for an in-flight HTTP retry to finish or fail.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Logs to stdout/stderr → journald. Pair with `journalctl -u process-b`.
+# Our JSON formatter makes `journalctl -u process-b -o cat | jq` queryable.
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening -----------------------------------------------------------
+# These knobs are "free" defense in depth. If you remove any, document why.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# The daemon writes to its SQLite outbox here; everything else is read-only.
+# Adjust the path if you change DB_PATH in the environment file.
+ReadWritePaths=/var/lib/process-b
+
+[Install]
+WantedBy=multi-user.target
