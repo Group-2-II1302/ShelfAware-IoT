@@ -51,3 +51,6 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
+logs/*.log
+logs/*.json
+process-a/baselines.json
