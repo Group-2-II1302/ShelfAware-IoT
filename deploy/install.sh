@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh  –  SmartShelf deployment script
+# install.sh  –  ShelfAware deployment script
 # =============================================================================
 # Run once on a freshly flashed Raspberry Pi OS Bookworm (headless).
 # Idempotent – safe to re-run.
+#
+# ⚠️  TAILSCALE WARNING: This script calls nmcli and systemctl which will
+#     modify NetworkManager and may sever your remote connection.
+#     Run from a local terminal or physical keyboard/monitor only.
 #
 # Usage:
 #   sudo bash install.sh
@@ -19,8 +23,9 @@ fatal() { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fatal "Must be run as root (sudo bash install.sh)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="/opt/smartshelf"
-SERVICE_FILE="smartshelf-orchestrator.service"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+INSTALL_DIR="/opt/shelfaware"
+SERVICE_FILE="shelfaware-orchestrator.service"
 
 # ── 1. Dependencies ──────────────────────────────────────────────────────────
 info "Installing system dependencies …"
@@ -30,58 +35,72 @@ apt-get install -y --no-install-recommends \
 
 # ── 2. Install Python deps ────────────────────────────────────────────────────
 info "Installing Python packages …"
-pip3 install --break-system-packages --quiet psutil
+pip3 install --break-system-packages --quiet \
+    adafruit-blinka \
+    adafruit-circuitpython-ads1x15
 
 # ── 3. Deploy application files ───────────────────────────────────────────────
 info "Deploying application to $INSTALL_DIR …"
-mkdir -p "$INSTALL_DIR"
-cp "$SCRIPT_DIR/orchestrator.py"   "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/wifi_connector.py" "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/orchestrator.py"
-chmod 644 "$INSTALL_DIR/wifi_connector.py"
+mkdir -p "$INSTALL_DIR/orchestration"
+mkdir -p "$INSTALL_DIR/process-a"
+mkdir -p "$INSTALL_DIR/process-b/process_b"
+mkdir -p "$INSTALL_DIR/process-c"
 
-# Placeholder stubs so the service can start even without real processes
-for proc in process_a process_b process_c; do
-    target="$INSTALL_DIR/${proc}.py"
-    if [[ ! -f "$target" ]]; then
-        warn "Stub: $target not found – creating placeholder."
-        cat > "$target" <<STUB
+# Orchestration layer
+cp "$REPO_ROOT/orchestration/orchestrator.py"              "$INSTALL_DIR/orchestration/"
+cp "$REPO_ROOT/orchestration/wifi_connector.py"            "$INSTALL_DIR/orchestration/"
+cp "$REPO_ROOT/orchestration/shelfaware_network_setup.sh"  "$INSTALL_DIR/orchestration/"
+chmod 755 "$INSTALL_DIR/orchestration/orchestrator.py"
+chmod 644 "$INSTALL_DIR/orchestration/wifi_connector.py"
+chmod 755 "$INSTALL_DIR/orchestration/shelfaware_network_setup.sh"
+
+# Process A
+cp "$REPO_ROOT/process-a/process_A.py" "$INSTALL_DIR/process-a/"
+chmod 755 "$INSTALL_DIR/process-a/process_A.py"
+
+# Process B
+cp -r "$REPO_ROOT/process-b/process_b/." "$INSTALL_DIR/process-b/process_b/"
+
+# Process C (placeholder until ready)
+if [[ -f "$REPO_ROOT/process-c/process_c.py" ]]; then
+    cp "$REPO_ROOT/process-c/process_c.py" "$INSTALL_DIR/process-c/"
+    chmod 755 "$INSTALL_DIR/process-c/process_c.py"
+else
+    warn "process_c.py not found – creating placeholder stub."
+    cat > "$INSTALL_DIR/process-c/process_c.py" <<STUB
 #!/usr/bin/env python3
 import time, logging
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("${proc}")
-log.info("${proc} placeholder running – replace with real implementation.")
+log = logging.getLogger("process_c")
+log.info("process_c placeholder – replace with real implementation.")
 while True:
     time.sleep(60)
 STUB
-        chmod 755 "$target"
-    fi
-done
+    chmod 755 "$INSTALL_DIR/process-c/process_c.py"
+fi
 
-# ── 4. State directory ────────────────────────────────────────────────────────
-mkdir -p /var/lib/smartshelf
-chmod 750 /var/lib/smartshelf
+# ── 4. State and log directories ──────────────────────────────────────────────
+mkdir -p /var/lib/shelfaware
+chmod 750 /var/lib/shelfaware
 
-# ── 5. Log directory ─────────────────────────────────────────────────────────
-touch /var/log/smartshelf_orchestrator.log
-chmod 640 /var/log/smartshelf_orchestrator.log
+touch /var/log/shelfaware_orchestrator.log
+chmod 640 /var/log/shelfaware_orchestrator.log
 
-# ── 6. NetworkManager – ensure it's running ───────────────────────────────────
+# ── 5. NetworkManager – ensure it's running ───────────────────────────────────
 info "Enabling NetworkManager …"
 systemctl enable NetworkManager
 systemctl start  NetworkManager
 
-# Wait for NM to be available
 for i in {1..10}; do
     nmcli general status &>/dev/null && break
     warn "Waiting for nmcli ($i/10) …"; sleep 2
 done
 
-# ── 7. Pre-configure the AP hotspot profile ───────────────────────────────────
+# ── 6. Pre-configure the AP hotspot profile ───────────────────────────────────
 info "Configuring AP hotspot profile …"
-bash "$SCRIPT_DIR/smartshelf_network_setup.sh"
+bash "$INSTALL_DIR/orchestration/shelfaware_network_setup.sh"
 
-# ── 8. Install and enable the systemd service ────────────────────────────────
+# ── 7. Install and enable the systemd service ─────────────────────────────────
 info "Installing systemd service …"
 cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/
 systemctl daemon-reload
@@ -90,7 +109,7 @@ systemctl enable "$SERVICE_FILE"
 info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 info "Installation complete."
 info ""
-info "Start the service now:  systemctl start smartshelf-orchestrator"
-info "Watch live logs:        journalctl -fu smartshelf-orchestrator"
-info "Or tail the file:       tail -f /var/log/smartshelf_orchestrator.log"
+info "Start the service now:  systemctl start shelfaware-orchestrator"
+info "Watch live logs:        journalctl -fu shelfaware-orchestrator"
+info "Or tail the file:       tail -f /var/log/shelfaware_orchestrator.log"
 info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
