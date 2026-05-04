@@ -10,35 +10,43 @@ Backend contract (IMMUTABLE):
   Reordering SENSOR_SEQUENCE breaks Process B.  Do not reorder.
 
 Polling strategy (Delta-Based Activity Trigger):
-  ACTIVE  – a sensor delta > change_threshold_g was detected within
+  ACTIVE  - a sensor delta > change_threshold_g was detected within
             the last active_cooldown_s seconds. Poll at interval_active.
-  IDLE    – no significant delta detected recently. Poll at interval_idle.
-            Still reads all sensors for drift compensation, just less often.
+  IDLE    - no significant delta detected recently. Poll at interval_idle.
 
-  A shelf with 5kg sitting still is IDLE.
-  A shelf where a user is adding/removing items is ACTIVE.
+CPU governor strategy:
+  ACTIVE -> "performance"  (locks CPU to max 1500MHz)
+  IDLE   -> "ondemand"     (CPU scales naturally with load)
+
+  "ondemand" chosen over "powersave" to protect WiFi throughput.
+  The WiFi chip (CYW43455) is on a separate clock domain and is never
+  affected by cpufreq, but CPU starvation at 600MHz could cause UDP
+  processing latency in Process B. "ondemand" avoids this entirely.
+
+  Governor writes require root OR the following sudoers rule:
+    group2 ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+  In production (systemd, runs as root) sudo is bypassed automatically.
+  If neither condition is met, a warning is logged and the process
+  continues normally - governor management is non-critical.
 
 Fault model:
-  • If an entire ADC is missing at boot (e.g. 0x49 wire loose), that
-    chip is marked FAULTED and its three channels emit null payloads
-    with an "adc_fault" flag every cycle so Process B can distinguish
-    "sensor reads zero" from "sensor is dead".
-  • If a single read fails mid-run, the error is logged and that
-    sample is skipped; the loop continues for all other sensors.
-  • If the I2C bus itself dies, the exception propagates to main()
-    which logs it and exits cleanly (letting systemd/orchestrator
-    decide whether to restart).
+  If an entire ADC is missing at boot, it is marked FAULTED and its
+  channels emit null payloads with adc_fault=True every cycle.
+  Single read failures are logged and skipped; loop continues.
+  I2C bus death propagates to main() for orchestrator to handle.
 """
 
 import json
 import logging
 import os
 import socket
+import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Dict, Optional
 
 import board
@@ -46,9 +54,9 @@ import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Logging
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def _build_logger() -> logging.Logger:
     fmt = logging.Formatter(
@@ -63,7 +71,6 @@ def _build_logger() -> logging.Logger:
     handler.setFormatter(fmt)
     console = logging.StreamHandler()
     console.setFormatter(fmt)
-
     log = logging.getLogger("shelfaware.process_a")
     log.setLevel(logging.DEBUG)
     log.addHandler(handler)
@@ -73,9 +80,9 @@ def _build_logger() -> logging.Logger:
 
 log = _build_logger()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Configuration
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 @dataclass
 class SensorConfig:
@@ -97,38 +104,31 @@ class SystemConfig:
     near_zero_threshold: int   = 300
     storage_path:        str   = "baselines.json"
     fault_threshold:     int   = 5
-
-    # ── Delta-Based Activity Trigger ──────────────────────────────────────────
-    # Fast polling rate when user interaction is detected
+    # Delta-Based Activity Trigger
     interval_active:     float = 0.5
-    # Slow polling rate when shelf is mechanically idle (items just resting)
     interval_idle:       float = 10.0
-    # How long (seconds) to stay in ACTIVE mode after the last detected delta
     active_cooldown_s:   float = 10.0
-    # Minimum gram change required to count as user interaction (filters drift)
     change_threshold_g:  float = 15.0
+    # CPU Governor
+    governor_active:     str   = "performance"
+    governor_idle:       str   = "ondemand"
 
 
 CONFIG = SystemConfig()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Sensor map  (insertion order is the scale_index contract)
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 SENSOR_MAP: Dict[str, SensorConfig] = {
-    # ── Zone 1  –  ADC 0x48  –  scale_index 0, 1, 2 ─────────────────────────
     "Z1_A0": SensorConfig(adc_channel=0, adc_address=0x48),
     "Z1_A1": SensorConfig(adc_channel=1, adc_address=0x48),
     "Z1_A2": SensorConfig(adc_channel=2, adc_address=0x48),
-    # ── Zone 2  –  ADC 0x49  –  scale_index 3, 4, 5 ─────────────────────────
     "Z2_A0": SensorConfig(adc_channel=0, adc_address=0x49),
     "Z2_A1": SensorConfig(adc_channel=1, adc_address=0x49),
     "Z2_A2": SensorConfig(adc_channel=2, adc_address=0x49),
 }
 
-# Explicit ordered sequence – this is the SINGLE source of truth for
-# scale_index assignment.  enumerate(SENSOR_SEQUENCE) → (scale_index, s_id).
-# Never derive this from dict.keys() alone; be explicit.
 SENSOR_SEQUENCE = [
     "Z1_A0",  # scale_index 0
     "Z1_A1",  # scale_index 1
@@ -138,28 +138,133 @@ SENSOR_SEQUENCE = [
     "Z2_A2",  # scale_index 5
 ]
 
-# Validate at import time – catches typos before the Pi boots
-assert set(SENSOR_SEQUENCE) == set(SENSOR_MAP.keys()), (
-    "SENSOR_SEQUENCE and SENSOR_MAP are out of sync. "
-    "Every sensor must appear in both, exactly once."
-)
-assert len(SENSOR_SEQUENCE) == len(set(SENSOR_SEQUENCE)), (
+assert set(SENSOR_SEQUENCE) == set(SENSOR_MAP.keys()), \
+    "SENSOR_SEQUENCE and SENSOR_MAP are out of sync."
+assert len(SENSOR_SEQUENCE) == len(set(SENSOR_SEQUENCE)), \
     "SENSOR_SEQUENCE contains duplicates."
-)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Hardware manager  (handles multiple I2C addresses)
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# CPU Governor Manager
+# ------------------------------------------------------------------------------
+
+class CpuGovernor:
+    """
+    Manages the Linux cpufreq governor in sync with the shelf activity state.
+
+    Write strategy (tried in order until one succeeds):
+      1. Direct sysfs write  - works when running as root (production/systemd).
+      2. sudo tee            - works in dev when the sudoers rule is in place.
+      3. Disabled            - logs a warning once and never tries again.
+
+    Only writes to sysfs when the governor actually needs to change,
+    avoiding redundant kernel calls every cycle.
+    """
+
+    GOVERNOR_PATH  = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    AVAILABLE_PATH = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors")
+
+    def __init__(self, governor_active: str, governor_idle: str):
+        self._governor_active   = governor_active
+        self._governor_idle     = governor_idle
+        self._current_governor: Optional[str] = None
+        self._enabled           = self._check_available()
+
+    def _check_available(self) -> bool:
+        if not self.GOVERNOR_PATH.exists():
+            log.warning(
+                "CpuGovernor: sysfs path not found (%s). "
+                "CPU frequency management disabled.", self.GOVERNOR_PATH,
+            )
+            return False
+        try:
+            available = self.AVAILABLE_PATH.read_text().split()
+            for gov in (self._governor_active, self._governor_idle):
+                if gov not in available:
+                    log.warning(
+                        "CpuGovernor: governor '%s' not available. "
+                        "Available: %s. CPU frequency management disabled.",
+                        gov, available,
+                    )
+                    return False
+        except Exception as exc:
+            log.warning("CpuGovernor: could not read available governors: %s", exc)
+            return False
+
+        log.info("CpuGovernor: initialised. active='%s'  idle='%s'",
+                 self._governor_active, self._governor_idle)
+        return True
+
+    def _write_governor(self, governor: str) -> bool:
+        # Strategy 1: direct write (root / production)
+        try:
+            self.GOVERNOR_PATH.write_text(governor)
+            return True
+        except PermissionError:
+            pass
+        except Exception as exc:
+            log.warning("CpuGovernor: direct write failed: %s", exc)
+            return False
+
+        # Strategy 2: sudo tee (dev with sudoers rule)
+        try:
+            result = subprocess.run(
+                ["sudo", "tee", str(self.GOVERNOR_PATH)],
+                input=governor,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return True
+            log.warning("CpuGovernor: sudo tee failed (rc=%d): %s",
+                        result.returncode, result.stderr.strip())
+        except subprocess.TimeoutExpired:
+            log.warning("CpuGovernor: sudo tee timed out.")
+        except Exception as exc:
+            log.warning("CpuGovernor: sudo tee error: %s", exc)
+
+        return False
+
+    def set(self, is_active: bool) -> None:
+        """
+        Call once per cycle with the current activity state.
+        No-ops if governor is already correct.
+        """
+        if not self._enabled:
+            return
+
+        target = self._governor_active if is_active else self._governor_idle
+
+        if target == self._current_governor:
+            return
+
+        if self._write_governor(target):
+            log.info("CpuGovernor: %s -> %s",
+                     self._current_governor or "unknown", target)
+            self._current_governor = target
+        else:
+            log.error(
+                "CpuGovernor: could not write governor '%s'. "
+                "Check sudoers rule or run as root. Disabling for this session.",
+                target,
+            )
+            self._enabled = False
+
+    def restore_default(self) -> None:
+        """Restore 'ondemand' on clean exit."""
+        if not self._enabled:
+            return
+        if self._write_governor("ondemand"):
+            log.info("CpuGovernor: restored to 'ondemand' on exit.")
+        else:
+            log.warning("CpuGovernor: could not restore governor on exit.")
+
+
+# ------------------------------------------------------------------------------
+# Hardware manager
+# ------------------------------------------------------------------------------
 
 class HardwareManager:
-    """
-    Singleton-style I2C / ADC factory.
-
-    One shared I2C bus.  One ADS1115 instance per unique address.
-    Addresses that fail to initialise are placed in _faulted_addresses
-    so the rest of the system degrades gracefully.
-    """
-
     _i2c: Optional[busio.I2C]              = None
     _ads_instances: Dict[int, ADS.ADS1115] = {}
     _faulted_addresses: set                = set()
@@ -174,24 +279,18 @@ class HardwareManager:
     def get_adc_channel(cls, address: int, channel_index: int) -> Optional[AnalogIn]:
         if address in cls._faulted_addresses:
             return None
-
         cls._ensure_i2c()
-
         if address not in cls._ads_instances:
             try:
-                cls._ads_instances[address] = ADS.ADS1115(
-                    cls._i2c, address=address
-                )
+                cls._ads_instances[address] = ADS.ADS1115(cls._i2c, address=address)
                 log.info("ADS1115 at 0x%02X initialised.", address)
             except Exception as exc:
                 log.error(
                     "Failed to initialise ADS1115 at 0x%02X: %s. "
-                    "All channels on this ADC will be marked faulted.",
-                    address, exc,
+                    "All channels on this ADC will be marked faulted.", address, exc,
                 )
                 cls._faulted_addresses.add(address)
                 return None
-
         return AnalogIn(cls._ads_instances[address], channel_index)
 
     @classmethod
@@ -199,9 +298,9 @@ class HardwareManager:
         return address in cls._faulted_addresses
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Signal processing
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 class MovingAverage:
     def __init__(self, size: int):
@@ -217,10 +316,7 @@ class MovingAverage:
 
 
 class PersistentDriftCompensator:
-    """
-    Loads and saves per-sensor baselines to disk so zero-point drift
-    survives reboots.  DO NOT MODIFY – untouched per spec.
-    """
+    """DO NOT MODIFY - untouched per spec."""
 
     def __init__(self, sensor_id: str):
         self.sensor_id = sensor_id
@@ -232,8 +328,7 @@ class PersistentDriftCompensator:
                 with open(CONFIG.storage_path, "r") as f:
                     return json.load(f).get(self.sensor_id)
             except Exception as exc:
-                log.warning("Could not load baseline for %s: %s",
-                            self.sensor_id, exc)
+                log.warning("Could not load baseline for %s: %s", self.sensor_id, exc)
         return None
 
     def _save_baseline(self, value: float) -> None:
@@ -257,15 +352,13 @@ class PersistentDriftCompensator:
             self._save_baseline(filtered_adc)
             log.info("Baseline captured for %s: %.1f", self.sensor_id, filtered_adc)
             return 0.0
-
         if filtered_adc <= CONFIG.near_zero_threshold:
             drift_delta = abs(filtered_adc - self._baseline)
             if (drift_delta / (self._baseline + 1)) > CONFIG.drift_margin:
-                log.debug("Drift corrected for %s: %.1f → %.1f",
+                log.debug("Drift corrected for %s: %.1f -> %.1f",
                           self.sensor_id, self._baseline, filtered_adc)
                 self._baseline = filtered_adc
                 self._save_baseline(filtered_adc)
-
         return max(0.0, filtered_adc - self._baseline)
 
 
@@ -275,9 +368,9 @@ def adc_to_grams(adc: float, cfg: SensorConfig) -> float:
     return (adc / cfg.a_const) ** (1.0 / cfg.b_const)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Per-sensor fault tracker
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 class SensorFaultTracker:
     def __init__(self, sensor_id: str, threshold: int = CONFIG.fault_threshold):
@@ -295,10 +388,8 @@ class SensorFaultTracker:
     def record_failure(self, exc: Exception) -> None:
         self._consecutive += 1
         if self._consecutive >= self.threshold and not self._is_faulted:
-            log.error(
-                "Sensor %s faulted after %d consecutive errors. Last: %s",
-                self.sensor_id, self._consecutive, exc,
-            )
+            log.error("Sensor %s faulted after %d consecutive errors. Last: %s",
+                      self.sensor_id, self._consecutive, exc)
             self._is_faulted = True
         elif not self._is_faulted:
             log.warning("Sensor %s read error (%d/%d): %s",
@@ -309,9 +400,9 @@ class SensorFaultTracker:
         return self._is_faulted
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Main loop
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def main() -> None:
     log.info("=" * 60)
@@ -326,7 +417,10 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    # ── Initialise per-sensor objects ─────────────────────────────────────────
+    # CPU Governor - initialised once, used every cycle
+    cpu = CpuGovernor(CONFIG.governor_active, CONFIG.governor_idle)
+
+    # Per-sensor objects
     filters:        Dict[str, MovingAverage]              = {}
     compensators:   Dict[str, PersistentDriftCompensator] = {}
     fault_trackers: Dict[str, SensorFaultTracker]         = {}
@@ -340,37 +434,29 @@ def main() -> None:
             cfg.adc_address, cfg.adc_channel
         )
         status = "OK" if channels[s_id] is not None else "FAULTED (ADC init failed)"
-        log.info("Channel %s at 0x%02X ch%d → %s",
+        log.info("Channel %s at 0x%02X ch%d -> %s",
                  s_id, cfg.adc_address, cfg.adc_channel, status)
 
     log.info("Initialisation complete. Entering read loop.")
 
-    # ── Delta-Based Activity State ─────────────────────────────────────────────
-    # Tracks the last confirmed gram reading per sensor.
-    # Initialised to 0.0 — first cycle will always compute a delta from zero,
-    # but only triggers ACTIVE if that delta exceeds change_threshold_g.
-    previous_grams: Dict[str, float] = {s: 0.0 for s in SENSOR_SEQUENCE}
+    # Delta-Based Activity State
+    previous_grams:   Dict[str, float] = {s: 0.0 for s in SENSOR_SEQUENCE}
+    last_activity_ts: float            = 0.0
 
-    # Timestamp of the last sensor delta that exceeded change_threshold_g.
-    # Initialised to 0.0 so the system starts in IDLE mode on boot.
-    last_activity_ts: float = 0.0
-
-    # ── Read loop ─────────────────────────────────────────────────────────────
     while True:
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        # Determine current mode BEFORE processing this cycle's readings.
-        # This ensures the print statements reflect the mode that governed
-        # the sleep we just woke up from, which is what Furkan wants to see.
-        is_active = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
+        timestamp  = datetime.now(timezone.utc).isoformat()
+        is_active  = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
         mode_label = "ACTIVE" if is_active else "IDLE  "
+
+        # Apply governor at the START of each cycle
+        cpu.set(is_active)
 
         for scale_index, s_id in enumerate(SENSOR_SEQUENCE):
             cfg     = SENSOR_MAP[s_id]
             channel = channels[s_id]
             zone    = "Z1" if cfg.adc_address == 0x48 else "Z2"
 
-            # ── ADC-level fault ───────────────────────────────────────────────
+            # ADC-level fault
             if channel is None or HardwareManager.is_address_faulted(cfg.adc_address):
                 payload = {
                     "est_grams":   None,
@@ -380,15 +466,10 @@ def main() -> None:
                     "adc_fault":   True,
                     "sensor_id":   s_id,
                 }
-                sock.sendto(
-                    json.dumps(payload).encode(),
-                    (CONFIG.udp_ip, CONFIG.udp_port),
-                )
-                log.debug("[%s] scale_index=%d  ADC FAULTED – null payload sent.",
-                          s_id, scale_index)
+                sock.sendto(json.dumps(payload).encode(), (CONFIG.udp_ip, CONFIG.udp_port))
+                log.debug("[%s] scale_index=%d  ADC FAULTED.", s_id, scale_index)
                 continue
 
-            # ── Normal read path ──────────────────────────────────────────────
             try:
                 raw_val   = channel.value
                 clean     = 0 if raw_val < CONFIG.deadzone_adc else raw_val
@@ -398,28 +479,18 @@ def main() -> None:
 
                 fault_trackers[s_id].record_success()
 
-                # ── Delta-Based Activity Trigger ──────────────────────────────
+                # Delta-Based Activity Trigger
                 delta = abs(grams - previous_grams[s_id])
-
                 if delta > CONFIG.change_threshold_g:
-                    # Significant change detected — user is interacting.
-                    # Reset the cooldown clock.
                     last_activity_ts = time.time()
-                    log.debug(
-                        "[%s] Activity detected: delta=%.1fg "
-                        "(%.1f → %.1f). Cooldown reset.",
-                        s_id, delta, previous_grams[s_id], grams,
-                    )
-
-                # Update previous reading for next cycle's delta calculation
+                    log.debug("[%s] Activity: delta=%.1fg (%.1f->%.1f). Cooldown reset.",
+                              s_id, delta, previous_grams[s_id], grams)
                 previous_grams[s_id] = grams
-                # ── End Delta Logic ───────────────────────────────────────────
 
-                # Terminal diagnostic — mode label visible for Furkan's testing
                 print(
                     f"[{mode_label}] [{s_id}({zone}|idx={scale_index})] "
                     f"ADC:{raw_val:5}  Corr:{corrected:7.1f}  "
-                    f"g:{grams:7.2f}  Δ:{delta:6.1f}g"
+                    f"g:{grams:7.2f}  d:{delta:6.1f}g"
                 )
 
                 payload = {
@@ -429,10 +500,7 @@ def main() -> None:
                     "scale_index": scale_index,
                     "adc_fault":   False,
                 }
-                sock.sendto(
-                    json.dumps(payload).encode(),
-                    (CONFIG.udp_ip, CONFIG.udp_port),
-                )
+                sock.sendto(json.dumps(payload).encode(), (CONFIG.udp_ip, CONFIG.udp_port))
 
             except Exception as exc:
                 fault_trackers[s_id].record_failure(exc)
@@ -444,16 +512,14 @@ def main() -> None:
                     "adc_fault":   True,
                     "sensor_id":   s_id,
                 }
-                sock.sendto(
-                    json.dumps(payload).encode(),
-                    (CONFIG.udp_ip, CONFIG.udp_port),
-                )
+                sock.sendto(json.dumps(payload).encode(), (CONFIG.udp_ip, CONFIG.udp_port))
 
-        # ── Dynamic Sleep ─────────────────────────────────────────────────────
-        # Re-evaluate is_active after processing all sensors this cycle,
-        # in case a delta was detected mid-loop that should affect sleep now.
-        is_active = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
+        # Re-evaluate after full sweep — a delta mid-loop takes effect now
+        is_active      = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
         sleep_duration = CONFIG.interval_active if is_active else CONFIG.interval_idle
+
+        # Update governor if state flipped during the sweep
+        cpu.set(is_active)
 
         log.debug("Cycle complete. Mode: %s. Sleeping %.1fs.",
                   "ACTIVE" if is_active else "IDLE", sleep_duration)
@@ -469,3 +535,8 @@ if __name__ == "__main__":
     except Exception as exc:
         log.critical("Process A crashed: %s", exc, exc_info=True)
         raise
+    finally:
+        try:
+            CpuGovernor(CONFIG.governor_active, CONFIG.governor_idle).restore_default()
+        except Exception:
+            pass
