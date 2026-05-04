@@ -279,6 +279,68 @@ class TestGetCommands:
         assert exc.value.status == 401
 
 
+class TestRegisterShelf:
+    @respx.mock
+    async def test_2xx_returns_parsed_response(self) -> None:
+        route = respx.post(f"{BASE_URL}/shelves").mock(
+            return_value=httpx.Response(
+                200, json={"shelf_id": SHELF_A, "user_id": "u1"}
+            )
+        )
+
+        async with _client() as client:
+            result = await client.register_shelf(shelf_id=SHELF_A, user_id="u1")
+
+        assert result.shelf_id == SHELF_A
+        assert route.called
+
+    @respx.mock
+    async def test_sends_required_headers_and_body(self) -> None:
+        captured: dict[str, object] = {}
+
+        def capture(request: httpx.Request) -> httpx.Response:
+            captured["body"] = request.content
+            captured["auth"] = request.headers.get("Authorization")
+            captured["shelf_header"] = request.headers.get("X-Shelf-Id")
+            return httpx.Response(201, json={"shelf_id": SHELF_A})
+
+        respx.post(f"{BASE_URL}/shelves").mock(side_effect=capture)
+
+        async with _client() as client:
+            await client.register_shelf(shelf_id=SHELF_A, user_id="u1")
+
+        import json as _json
+
+        body = _json.loads(captured["body"])  # type: ignore[arg-type]
+        assert body == {"shelf_id": SHELF_A, "user_id": "u1"}
+        assert captured["auth"] == f"Bearer {API_KEY}"
+        assert captured["shelf_header"] == SHELF_A
+
+    @respx.mock
+    async def test_5xx_raises_transient_error(self) -> None:
+        respx.post(f"{BASE_URL}/shelves").mock(
+            return_value=httpx.Response(503, text="upstream down")
+        )
+
+        async with _client() as client:
+            with pytest.raises(TransientBackendError) as exc:
+                await client.register_shelf(shelf_id=SHELF_A, user_id="u1")
+
+        assert exc.value.status == 503
+
+    @respx.mock
+    async def test_4xx_raises_permanent_error(self) -> None:
+        respx.post(f"{BASE_URL}/shelves").mock(
+            return_value=httpx.Response(400, text="invalid user_id")
+        )
+
+        async with _client() as client:
+            with pytest.raises(PermanentBackendError) as exc:
+                await client.register_shelf(shelf_id=SHELF_A, user_id="u1")
+
+        assert exc.value.status == 400
+
+
 class TestLifecycle:
     async def test_aclose_closes_underlying_client(self) -> None:
         client = _client()

@@ -15,6 +15,9 @@ import os
 from dataclasses import dataclass
 from typing import Mapping
 
+from process_b import device_state
+from process_b.device_state import DeviceStateError
+
 
 class ConfigError(ValueError):
     """Raised when one or more required env vars are missing or malformed.
@@ -32,7 +35,15 @@ class Config:
     backend_url: str
     db_path: str
 
+    # If device.json was present at startup, ``shelf_ids`` is a single-element
+    # tuple containing its shelf_id and ``user_id`` is the bound user.
+    # If device.json was absent (legacy / dev), ``shelf_ids`` comes from the
+    # SHELF_IDS env var and ``user_id`` is ``None`` (no shelf-registration
+    # call will be made by main.py).
     shelf_ids: tuple[str, ...]
+    user_id: str | None
+
+    device_file_path: str
 
     udp_listen_host: str
     udp_listen_port: int
@@ -98,13 +109,37 @@ class Config:
         backend_url = require("BACKEND_URL").rstrip("/")
         db_path = require("DB_PATH")
 
-        shelf_ids_raw = require("SHELF_IDS")
+        device_file_path = optional("DEVICE_FILE_PATH", "/etc/shelfaware/device.json")
+
+        # Resolve shelf identity. Precedence:
+        #   1. device.json (Process C wrote it at provisioning time)
+        #   2. SHELF_IDS env var (legacy / dev / pre-provisioning)
+        # If both are present, device.json wins; the env var is ignored. If
+        # device.json exists but is malformed, fail loud — silently falling
+        # back to env would mask real corruption.
         shelf_ids: tuple[str, ...] = ()
-        if shelf_ids_raw:
-            parts = tuple(s.strip() for s in shelf_ids_raw.split(",") if s.strip())
-            if not parts:
-                errors.append("SHELF_IDS must contain at least one shelf UUID")
-            shelf_ids = parts
+        user_id: str | None = None
+        try:
+            persisted = device_state.read(device_file_path)
+        except DeviceStateError as exc:
+            errors.append(f"DEVICE_FILE_PATH ({device_file_path}) is unreadable: {exc}")
+            persisted = None
+
+        if persisted is not None:
+            shelf_ids = (persisted.shelf_id,)
+            user_id = persisted.user_id
+        else:
+            shelf_ids_raw = source.get("SHELF_IDS", "").strip()
+            if not shelf_ids_raw:
+                errors.append(
+                    "SHELF_IDS is required when no device.json is present at "
+                    f"{device_file_path} (Process C writes the file at provisioning time)"
+                )
+            else:
+                parts = tuple(s.strip() for s in shelf_ids_raw.split(",") if s.strip())
+                if not parts:
+                    errors.append("SHELF_IDS must contain at least one shelf UUID")
+                shelf_ids = parts
 
         udp_listen_host = optional("UDP_LISTEN_HOST", "0.0.0.0")
         udp_listen_port_raw = require("UDP_LISTEN_PORT")
@@ -138,6 +173,8 @@ class Config:
             backend_url=backend_url,
             db_path=db_path,
             shelf_ids=shelf_ids,
+            user_id=user_id,
+            device_file_path=device_file_path,
             udp_listen_host=udp_listen_host,
             udp_listen_port=udp_listen_port,
             proc_a_control_host=proc_a_control_host,

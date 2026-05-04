@@ -32,7 +32,7 @@ from typing import NoReturn
 
 import aiosqlite
 
-from process_b import db, drainer, logging_setup, poller, udp_listener
+from process_b import db, drainer, logging_setup, poller, registrar, udp_listener
 from process_b.backend_client import BackendClient
 from process_b.config import Config, ConfigError
 
@@ -136,6 +136,20 @@ async def _run_workers(
             ),
             name="poller",
         )
+        # Best-effort shelf registration. Only runs when device.json was
+        # present (i.e. Process C provisioned this Pi); pre-provisioning
+        # / dev runs use SHELF_IDS env var with no user_id and skip this.
+        if config.user_id is not None:
+            for shelf_id in config.shelf_ids:
+                tg.create_task(
+                    registrar.register_with_backoff(
+                        client=client,
+                        shelf_id=shelf_id,
+                        user_id=config.user_id,
+                        stop_event=stop_event,
+                    ),
+                    name=f"registrar:{shelf_id[:8]}",
+                )
 
 
 def _install_signal_handlers(stop_event: asyncio.Event) -> None:

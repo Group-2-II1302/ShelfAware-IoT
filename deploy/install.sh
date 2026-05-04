@@ -51,7 +51,7 @@ info "Deploying application to $INSTALL_DIR …"
 mkdir -p "$INSTALL_DIR/orchestration"
 mkdir -p "$INSTALL_DIR/process-a"
 mkdir -p "$INSTALL_DIR/process-b/process_b"
-mkdir -p "$INSTALL_DIR/process-c"
+mkdir -p "$INSTALL_DIR/process-c/process_c"
 
 # Orchestration layer
 cp "$REPO_ROOT/orchestration/orchestrator.py"              "$INSTALL_DIR/orchestration/"
@@ -75,12 +75,22 @@ fi
 info "Installing Process B's Python dependencies …"
 pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-b"
 
-# Process C (placeholder until ready)
-if [[ -f "$REPO_ROOT/process-c/process_c.py" ]]; then
-    cp "$REPO_ROOT/process-c/process_c.py" "$INSTALL_DIR/process-c/"
+# Process C: stage source AND pyproject so we can pip install from $INSTALL_DIR.
+# The orchestrator launches it via /opt/shelfaware/process-c/process_c.py
+# (a small shim that forwards to process_c.main:run on the installed package).
+if [[ -d "$REPO_ROOT/process-c/process_c" ]]; then
+    cp -r "$REPO_ROOT/process-c/process_c/." "$INSTALL_DIR/process-c/process_c/"
+    cp    "$REPO_ROOT/process-c/pyproject.toml" "$INSTALL_DIR/process-c/"
+    if [[ -f "$REPO_ROOT/process-c/README.md" ]]; then
+        cp "$REPO_ROOT/process-c/README.md" "$INSTALL_DIR/process-c/"
+    fi
+    cp "$REPO_ROOT/process-c/process_c.py" "$INSTALL_DIR/process-c/process_c.py"
     chmod 755 "$INSTALL_DIR/process-c/process_c.py"
+
+    info "Installing Process C's Python dependencies …"
+    pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-c"
 else
-    warn "process_c.py not found – creating placeholder stub."
+    warn "process-c package not found – creating placeholder stub."
     cat > "$INSTALL_DIR/process-c/process_c.py" <<STUB
 #!/usr/bin/env python3
 import time, logging

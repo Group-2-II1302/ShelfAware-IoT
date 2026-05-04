@@ -101,6 +101,28 @@ class CommandsResponse(BaseModel):
     commands: list[Command] = Field(default_factory=list)
 
 
+class ShelfRegistrationRequest(BaseModel):
+    """Request body for ``POST /shelves`` (provisioning callback)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    shelf_id: str
+    user_id: str
+
+
+class ShelfRegistrationResponse(BaseModel):
+    """Parsed body from ``POST /shelves``.
+
+    The backend's exact response shape is still being designed (see
+    :meth:`BackendClient.register_shelf`); we accept any extra fields and
+    only require the ``shelf_id`` echo so we can confirm the round-trip.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    shelf_id: str
+
+
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 
 
@@ -186,6 +208,34 @@ class BackendClient:
         response = await self._request("GET", "/commands", shelf_id=shelf_id)
         parsed = _parse(response, CommandsResponse)
         return parsed.commands
+
+    async def register_shelf(
+        self, *, shelf_id: str, user_id: str
+    ) -> ShelfRegistrationResponse:
+        """POST a (shelf_id, user_id) pair so the backend creates / confirms
+        the shelves row.
+
+        Idempotency is the backend's responsibility (key on ``shelf_id``):
+        Process B calls this on every startup so a shelf row dropped from
+        the database is self-healing.
+
+        Raises
+        ------
+        TransientBackendError
+            5xx, network error, or timeout. Caller should retry.
+        PermanentBackendError
+            4xx or malformed-but-200. Caller should log loudly but keep
+            running — the daemon's other duties (telemetry, polling) are
+            still useful even if registration is wedged.
+        """
+        body = ShelfRegistrationRequest(
+            shelf_id=shelf_id, user_id=user_id
+        ).model_dump(mode="json")
+
+        response = await self._request(
+            "POST", "/shelves", shelf_id=shelf_id, json=body
+        )
+        return _parse(response, ShelfRegistrationResponse)
 
     async def _request(
         self,
