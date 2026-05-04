@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-process_a.py  –  SmartShelf Sensor Reader  (Dual-Zone Edition)
+process_A.py  –  ShelfAware Sensor Reader  (Dual-Zone Edition)
 ==============================================================
 Zone 1: ADC 0x48  →  Channels 0, 1, 2  →  scale_index 0, 1, 2
 Zone 2: ADC 0x49  →  Channels 0, 1, 2  →  scale_index 3, 4, 5
@@ -8,6 +8,15 @@ Zone 2: ADC 0x49  →  Channels 0, 1, 2  →  scale_index 3, 4, 5
 Backend contract (IMMUTABLE):
   scale_index is the position in SENSOR_SEQUENCE.
   Reordering SENSOR_SEQUENCE breaks Process B.  Do not reorder.
+
+Polling strategy (Delta-Based Activity Trigger):
+  ACTIVE  – a sensor delta > change_threshold_g was detected within
+            the last active_cooldown_s seconds. Poll at interval_active.
+  IDLE    – no significant delta detected recently. Poll at interval_idle.
+            Still reads all sensors for drift compensation, just less often.
+
+  A shelf with 5kg sitting still is IDLE.
+  A shelf where a user is adding/removing items is ACTIVE.
 
 Fault model:
   • If an entire ADC is missing at boot (e.g. 0x49 wire loose), that
@@ -27,7 +36,7 @@ import os
 import socket
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional
@@ -47,7 +56,7 @@ def _build_logger() -> logging.Logger:
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
     handler = RotatingFileHandler(
-        "/var/log/smartshelf_process_a.log",
+        "/var/log/shelfaware_process_a.log",
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
     )
@@ -55,7 +64,7 @@ def _build_logger() -> logging.Logger:
     console = logging.StreamHandler()
     console.setFormatter(fmt)
 
-    log = logging.getLogger("process_a")
+    log = logging.getLogger("shelfaware.process_a")
     log.setLevel(logging.DEBUG)
     log.addHandler(handler)
     log.addHandler(console)
@@ -86,11 +95,18 @@ class SystemConfig:
     window_size:         int   = 5
     drift_margin:        float = 0.15
     near_zero_threshold: int   = 300
-    interval_active:     float = 0.5
-    interval_idle:       float = 3.0
     storage_path:        str   = "baselines.json"
-    # How many consecutive read errors before we mark a channel faulted
     fault_threshold:     int   = 5
+
+    # ── Delta-Based Activity Trigger ──────────────────────────────────────────
+    # Fast polling rate when user interaction is detected
+    interval_active:     float = 0.5
+    # Slow polling rate when shelf is mechanically idle (items just resting)
+    interval_idle:       float = 10.0
+    # How long (seconds) to stay in ACTIVE mode after the last detected delta
+    active_cooldown_s:   float = 10.0
+    # Minimum gram change required to count as user interaction (filters drift)
+    change_threshold_g:  float = 15.0
 
 
 CONFIG = SystemConfig()
@@ -144,9 +160,9 @@ class HardwareManager:
     so the rest of the system degrades gracefully.
     """
 
-    _i2c: Optional[busio.I2C]          = None
+    _i2c: Optional[busio.I2C]              = None
     _ads_instances: Dict[int, ADS.ADS1115] = {}
-    _faulted_addresses: set            = set()
+    _faulted_addresses: set                = set()
 
     @classmethod
     def _ensure_i2c(cls) -> None:
@@ -156,10 +172,6 @@ class HardwareManager:
 
     @classmethod
     def get_adc_channel(cls, address: int, channel_index: int) -> Optional[AnalogIn]:
-        """
-        Returns an AnalogIn channel, or None if the ADC at `address` is faulted.
-        Raises exceptions for I2C bus-level failures (caller handles them).
-        """
         if address in cls._faulted_addresses:
             return None
 
@@ -186,6 +198,7 @@ class HardwareManager:
     def is_address_faulted(cls, address: int) -> bool:
         return address in cls._faulted_addresses
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Signal processing
 # ──────────────────────────────────────────────────────────────────────────────
@@ -206,7 +219,7 @@ class MovingAverage:
 class PersistentDriftCompensator:
     """
     Loads and saves per-sensor baselines to disk so zero-point drift
-    survives reboots.
+    survives reboots.  DO NOT MODIFY – untouched per spec.
     """
 
     def __init__(self, sensor_id: str):
@@ -261,22 +274,17 @@ def adc_to_grams(adc: float, cfg: SensorConfig) -> float:
         return 0.0
     return (adc / cfg.a_const) ** (1.0 / cfg.b_const)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-sensor fault tracker
 # ──────────────────────────────────────────────────────────────────────────────
 
 class SensorFaultTracker:
-    """
-    Counts consecutive read errors per sensor.
-    Once `threshold` is reached, the sensor is marked faulted and
-    logged at ERROR level (not every single cycle).
-    """
-
     def __init__(self, sensor_id: str, threshold: int = CONFIG.fault_threshold):
-        self.sensor_id        = sensor_id
-        self.threshold        = threshold
-        self._consecutive     = 0
-        self._is_faulted      = False
+        self.sensor_id    = sensor_id
+        self.threshold    = threshold
+        self._consecutive = 0
+        self._is_faulted  = False
 
     def record_success(self) -> None:
         if self._is_faulted:
@@ -288,19 +296,18 @@ class SensorFaultTracker:
         self._consecutive += 1
         if self._consecutive >= self.threshold and not self._is_faulted:
             log.error(
-                "Sensor %s faulted after %d consecutive errors. "
-                "Last error: %s",
+                "Sensor %s faulted after %d consecutive errors. Last: %s",
                 self.sensor_id, self._consecutive, exc,
             )
             self._is_faulted = True
         elif not self._is_faulted:
             log.warning("Sensor %s read error (%d/%d): %s",
-                        self.sensor_id, self._consecutive,
-                        self.threshold, exc)
+                        self.sensor_id, self._consecutive, self.threshold, exc)
 
     @property
     def is_faulted(self) -> bool:
         return self._is_faulted
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main loop
@@ -310,21 +317,26 @@ def main() -> None:
     log.info("=" * 60)
     log.info("PROCESS A STARTING  |  SHELF: %s", CONFIG.shelf_id)
     log.info("Sensor sequence (scale_index order): %s", SENSOR_SEQUENCE)
+    log.info(
+        "Delta-based polling | active=%.1fs  idle=%.1fs  "
+        "cooldown=%.1fs  threshold=%.1fg",
+        CONFIG.interval_active, CONFIG.interval_idle,
+        CONFIG.active_cooldown_s, CONFIG.change_threshold_g,
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     # ── Initialise per-sensor objects ─────────────────────────────────────────
-    filters:      Dict[str, MovingAverage]          = {}
-    compensators: Dict[str, PersistentDriftCompensator] = {}
-    fault_trackers: Dict[str, SensorFaultTracker]   = {}
-    channels:     Dict[str, Optional[AnalogIn]]     = {}
+    filters:        Dict[str, MovingAverage]              = {}
+    compensators:   Dict[str, PersistentDriftCompensator] = {}
+    fault_trackers: Dict[str, SensorFaultTracker]         = {}
+    channels:       Dict[str, Optional[AnalogIn]]         = {}
 
     for s_id, cfg in SENSOR_MAP.items():
-        filters[s_id]       = MovingAverage(CONFIG.window_size)
-        compensators[s_id]  = PersistentDriftCompensator(s_id)
+        filters[s_id]        = MovingAverage(CONFIG.window_size)
+        compensators[s_id]   = PersistentDriftCompensator(s_id)
         fault_trackers[s_id] = SensorFaultTracker(s_id)
-        # Channel init: failure here only faults this ADC, not the process
-        channels[s_id] = HardwareManager.get_adc_channel(
+        channels[s_id]       = HardwareManager.get_adc_channel(
             cfg.adc_address, cfg.adc_channel
         )
         status = "OK" if channels[s_id] is not None else "FAULTED (ADC init failed)"
@@ -333,17 +345,32 @@ def main() -> None:
 
     log.info("Initialisation complete. Entering read loop.")
 
+    # ── Delta-Based Activity State ─────────────────────────────────────────────
+    # Tracks the last confirmed gram reading per sensor.
+    # Initialised to 0.0 — first cycle will always compute a delta from zero,
+    # but only triggers ACTIVE if that delta exceeds change_threshold_g.
+    previous_grams: Dict[str, float] = {s: 0.0 for s in SENSOR_SEQUENCE}
+
+    # Timestamp of the last sensor delta that exceeded change_threshold_g.
+    # Initialised to 0.0 so the system starts in IDLE mode on boot.
+    last_activity_ts: float = 0.0
+
     # ── Read loop ─────────────────────────────────────────────────────────────
     while True:
-        timestamp          = datetime.now(timezone.utc).isoformat()
-        any_weight_detected = False
+        timestamp = datetime.now(timezone.utc).isoformat()
 
-        # enumerate(SENSOR_SEQUENCE) is the ONLY place scale_index is assigned.
+        # Determine current mode BEFORE processing this cycle's readings.
+        # This ensures the print statements reflect the mode that governed
+        # the sleep we just woke up from, which is what Furkan wants to see.
+        is_active = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
+        mode_label = "ACTIVE" if is_active else "IDLE  "
+
         for scale_index, s_id in enumerate(SENSOR_SEQUENCE):
             cfg     = SENSOR_MAP[s_id]
             channel = channels[s_id]
+            zone    = "Z1" if cfg.adc_address == 0x48 else "Z2"
 
-            # ── ADC-level fault: entire chip is down ──────────────────────────
+            # ── ADC-level fault ───────────────────────────────────────────────
             if channel is None or HardwareManager.is_address_faulted(cfg.adc_address):
                 payload = {
                     "est_grams":   None,
@@ -371,14 +398,28 @@ def main() -> None:
 
                 fault_trackers[s_id].record_success()
 
-                if grams > 10.0:
-                    any_weight_detected = True
+                # ── Delta-Based Activity Trigger ──────────────────────────────
+                delta = abs(grams - previous_grams[s_id])
 
-                # Terminal diagnostic line
-                zone = "Z1" if cfg.adc_address == 0x48 else "Z2"
+                if delta > CONFIG.change_threshold_g:
+                    # Significant change detected — user is interacting.
+                    # Reset the cooldown clock.
+                    last_activity_ts = time.time()
+                    log.debug(
+                        "[%s] Activity detected: delta=%.1fg "
+                        "(%.1f → %.1f). Cooldown reset.",
+                        s_id, delta, previous_grams[s_id], grams,
+                    )
+
+                # Update previous reading for next cycle's delta calculation
+                previous_grams[s_id] = grams
+                # ── End Delta Logic ───────────────────────────────────────────
+
+                # Terminal diagnostic — mode label visible for Furkan's testing
                 print(
-                    f"[{s_id}({zone}|idx={scale_index})] "
-                    f"ADC:{raw_val:5}  Corr:{corrected:7.1f}  g:{grams:7.2f}"
+                    f"[{mode_label}] [{s_id}({zone}|idx={scale_index})] "
+                    f"ADC:{raw_val:5}  Corr:{corrected:7.1f}  "
+                    f"g:{grams:7.2f}  Δ:{delta:6.1f}g"
                 )
 
                 payload = {
@@ -395,8 +436,6 @@ def main() -> None:
 
             except Exception as exc:
                 fault_trackers[s_id].record_failure(exc)
-                # Send a fault payload so Process B doesn't stall waiting
-                # for a reading that will never arrive this cycle
                 payload = {
                     "est_grams":   None,
                     "shelf_id":    CONFIG.shelf_id,
@@ -410,9 +449,16 @@ def main() -> None:
                     (CONFIG.udp_ip, CONFIG.udp_port),
                 )
 
-        time.sleep(
-            CONFIG.interval_active if any_weight_detected else CONFIG.interval_idle
-        )
+        # ── Dynamic Sleep ─────────────────────────────────────────────────────
+        # Re-evaluate is_active after processing all sensors this cycle,
+        # in case a delta was detected mid-loop that should affect sleep now.
+        is_active = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
+        sleep_duration = CONFIG.interval_active if is_active else CONFIG.interval_idle
+
+        log.debug("Cycle complete. Mode: %s. Sleeping %.1fs.",
+                  "ACTIVE" if is_active else "IDLE", sleep_duration)
+
+        time.sleep(sleep_duration)
 
 
 if __name__ == "__main__":
