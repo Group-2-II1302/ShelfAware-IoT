@@ -50,7 +50,7 @@ def _datagram(
     *,
     shelf_id: str = SHELF_A,
     scale_index: int = 0,
-    est_grams: float = 750.2,
+    est_grams: float | None = 750.2,
     sampled_at: str = "2026-04-21T08:30:00Z",
     extra: dict | None = None,
 ) -> bytes:
@@ -117,9 +117,33 @@ class TestParseDatagram:
         with pytest.raises(Exception):
             _parse_datagram(bad)
 
-    def test_unknown_field_is_rejected_due_to_extra_forbid(self) -> None:
-        with pytest.raises(Exception):
-            _parse_datagram(_datagram(extra={"surprise": "field"}))
+    def test_unknown_field_is_ignored(self) -> None:
+        # Schema is intentionally permissive (extra="ignore") so that new
+        # diagnostic fields from Process A (battery, sensor_id, ...) don't
+        # require a coordinated schema bump on every change.
+        result = _parse_datagram(_datagram(extra={"surprise": "field"}))
+        assert isinstance(result, IncomingReading)
+        assert result.shelf_id == SHELF_A
+
+    def test_adc_fault_field_is_parsed(self) -> None:
+        result = _parse_datagram(
+            _datagram(est_grams=None, extra={"adc_fault": True})  # type: ignore[arg-type]
+        )
+        assert result.adc_fault is True
+        assert result.est_grams is None
+
+    def test_adc_fault_defaults_false_when_omitted(self) -> None:
+        result = _parse_datagram(_datagram())
+        assert result.adc_fault is False
+
+    def test_null_est_grams_is_accepted_when_fault(self) -> None:
+        # est_grams: None is allowed at the parse layer; the persister is
+        # responsible for dropping fault rows. Keeping parse permissive lets
+        # us log/diagnose them rather than treating them as malformed.
+        result = _parse_datagram(
+            _datagram(est_grams=None, extra={"adc_fault": True})  # type: ignore[arg-type]
+        )
+        assert result.est_grams is None
 
     def test_negative_scale_index_is_rejected(self) -> None:
         with pytest.raises(Exception):
@@ -200,13 +224,38 @@ class TestProtocolPersistence:
         protocol.datagram_received(_datagram(scale_index=0), LOCAL_ADDR)
         protocol.datagram_received(b"garbage", LOCAL_ADDR)
         protocol.datagram_received(_datagram(scale_index=1, sampled_at="2026-04-21T08:30:01Z"), LOCAL_ADDR)
-        protocol.datagram_received(_datagram(extra={"unexpected": True}), LOCAL_ADDR)
+        protocol.datagram_received(b"\xff\xfe not utf-8", LOCAL_ADDR)
         protocol.datagram_received(_datagram(scale_index=2, sampled_at="2026-04-21T08:30:02Z"), LOCAL_ADDR)
 
         rows = await _wait_for_rows(db_conn, expected=3)
         await _drain_protocol_tasks(protocol)
         rows = await db.claim_batch(db_conn, batch_size=1000)
         assert {r.scale_index for r in rows} == {0, 1, 2}
+
+    async def test_adc_fault_datagram_is_skipped_not_persisted(
+        self, db_conn: aiosqlite.Connection
+    ) -> None:
+        # adc_fault=True means the sensor was unreadable this cycle. The
+        # backend's telemetry schema requires numeric est_grams so we can't
+        # forward it; drop at the listener instead of persisting an
+        # un-drainable row.
+        protocol = TelemetryProtocol(db_conn)
+
+        protocol.datagram_received(
+            _datagram(scale_index=0, est_grams=None, extra={"adc_fault": True}),  # type: ignore[arg-type]
+            LOCAL_ADDR,
+        )
+        protocol.datagram_received(_datagram(scale_index=1), LOCAL_ADDR)
+        protocol.datagram_received(
+            _datagram(scale_index=2, est_grams=None, extra={"adc_fault": True}),  # type: ignore[arg-type]
+            LOCAL_ADDR,
+        )
+
+        rows = await _wait_for_rows(db_conn, expected=1)
+        await _drain_protocol_tasks(protocol)
+        rows = await db.claim_batch(db_conn, batch_size=1000)
+        assert len(rows) == 1
+        assert rows[0].scale_index == 1
 
     async def test_aclose_drains_in_flight_tasks(
         self, db_conn: aiosqlite.Connection

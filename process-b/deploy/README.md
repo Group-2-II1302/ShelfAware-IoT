@@ -7,6 +7,14 @@ This directory contains the deployment artifacts for running Process B as a mana
 | `process-b.service`         | systemd unit definition.                                  |
 | `process-b.env.example`     | Template for the environment file (`PI_API_KEY`, etc.).   |
 
+> **Which deploy path should I use?**
+>
+> - **Production / shipping the Pi** → use the **root-level orchestrator** (`/deploy/install.sh` + `shelfaware-orchestrator.service`). The orchestrator handles AP-mode provisioning, ping-based mode switching, and starts Process A / B / C as child processes. Process B does **not** run as its own systemd service in this path — the orchestrator is its parent.
+> - **Running Process B alone** (no orchestrator, no Process A on the same Pi, e.g. for isolated dev/test or a non-Pi Linux box) → use the artifacts in *this* directory. They install Process B as a standalone systemd service.
+> - **Foreground / interactive run during development** → see [Quick start](#quick-start-foreground--interactive-run) below. No systemd at all.
+>
+> The two systemd paths are mutually exclusive — don't enable both at once or you'll have two processes fighting for the same UDP port and SQLite file.
+
 The runbook below assumes the Pi is reached over SSH via [Tailscale](https://tailscale.com). If you're on the same LAN as the Pi, replace `<pi-tailnet-name>` with the Pi's hostname or IP everywhere — every step after SSH is identical.
 
 ---

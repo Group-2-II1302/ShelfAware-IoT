@@ -42,6 +42,12 @@ Environment="SHELFAWARE_DEV=0"
 Environment="PYTHONUNBUFFERED=1"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# Process B reads its config from env vars (PI_API_KEY, BACKEND_URL,
+# SHELF_IDS, DB_PATH, ...). The orchestrator inherits this environment
+# and passes it through to Process B when it spawns it as a subprocess.
+# The file is created by deploy/install.sh; operator fills in real values.
+EnvironmentFile=/etc/shelfaware/process-b.env
+
 WorkingDirectory=/opt/shelfaware
 ExecStart=/usr/bin/python3 /opt/shelfaware/orchestration/orchestrator.py
 

@@ -63,6 +63,13 @@ def run() -> NoReturn:
     sys.exit(0)
 
 
+if __name__ == "__main__":
+    # Allows `python3 main.py` as well as the `process-b` console script.
+    # The orchestrator (orchestration/orchestrator.py) launches Process B
+    # by direct file path, so this block is required for that path.
+    run()
+
+
 async def main(config: Config) -> None:
     """Open resources, run the three worker tasks, clean up on exit."""
     stop_event = asyncio.Event()

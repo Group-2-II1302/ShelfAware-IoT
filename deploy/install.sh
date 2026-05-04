@@ -35,9 +35,16 @@ apt-get install -y --no-install-recommends \
 
 # ── 2. Install Python deps ────────────────────────────────────────────────────
 info "Installing Python packages …"
+
+# Process A: hardware drivers
 pip3 install --break-system-packages --quiet \
     adafruit-blinka \
     adafruit-circuitpython-ads1x15
+
+# Process B's runtime deps are installed in section 3 below, AFTER its
+# source has been staged to $INSTALL_DIR. Installing here would either
+# pin to the repo working tree (wrong: /opt is the source of truth in
+# production) or fail (no pyproject.toml in $INSTALL_DIR yet).
 
 # ── 3. Deploy application files ───────────────────────────────────────────────
 info "Deploying application to $INSTALL_DIR …"
@@ -58,8 +65,15 @@ chmod 755 "$INSTALL_DIR/orchestration/shelfaware_network_setup.sh"
 cp "$REPO_ROOT/process-a/process_A.py" "$INSTALL_DIR/process-a/"
 chmod 755 "$INSTALL_DIR/process-a/process_A.py"
 
-# Process B
+# Process B: stage source AND pyproject so we can pip install from $INSTALL_DIR
 cp -r "$REPO_ROOT/process-b/process_b/." "$INSTALL_DIR/process-b/process_b/"
+cp    "$REPO_ROOT/process-b/pyproject.toml" "$INSTALL_DIR/process-b/"
+if [[ -f "$REPO_ROOT/process-b/README.md" ]]; then
+    cp "$REPO_ROOT/process-b/README.md" "$INSTALL_DIR/process-b/"
+fi
+
+info "Installing Process B's Python dependencies …"
+pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-b"
 
 # Process C (placeholder until ready)
 if [[ -f "$REPO_ROOT/process-c/process_c.py" ]]; then
@@ -85,6 +99,39 @@ chmod 750 /var/lib/shelfaware
 
 touch /var/log/shelfaware_orchestrator.log
 chmod 640 /var/log/shelfaware_orchestrator.log
+
+# ── 4b. Process B environment file ────────────────────────────────────────────
+# Process B reads PI_API_KEY, BACKEND_URL, SHELF_IDS, DB_PATH, etc. from env.
+# The systemd unit loads them from /etc/shelfaware/process-b.env.
+# If the file doesn't already exist, drop a template that the operator must
+# fill in BEFORE the orchestrator first launches Process B.
+mkdir -p /etc/shelfaware
+chmod 750 /etc/shelfaware
+
+PROCESS_B_ENV="/etc/shelfaware/process-b.env"
+if [[ ! -f "$PROCESS_B_ENV" ]]; then
+    info "Creating Process B env template at $PROCESS_B_ENV …"
+    if [[ -f "$REPO_ROOT/process-b/deploy/process-b.env.example" ]]; then
+        cp "$REPO_ROOT/process-b/deploy/process-b.env.example" "$PROCESS_B_ENV"
+    else
+        cat > "$PROCESS_B_ENV" <<'ENV_TEMPLATE'
+# Process B environment file. Loaded by the orchestrator's systemd unit.
+# Fill in real values before starting shelfaware-orchestrator.
+PI_API_KEY=changeme
+BACKEND_URL=https://shelfaware-backend.example.workers.dev
+SHELF_IDS=00000000-0000-0000-0000-000000000000
+DB_PATH=/var/lib/shelfaware/process-b.sqlite
+UDP_LISTEN_HOST=127.0.0.1
+UDP_LISTEN_PORT=5005
+PROC_A_CONTROL_HOST=127.0.0.1
+PROC_A_CONTROL_PORT=5006
+ENV_TEMPLATE
+    fi
+    chmod 640 "$PROCESS_B_ENV"
+    warn "Edit $PROCESS_B_ENV with real values before starting the service."
+else
+    info "Process B env file already exists at $PROCESS_B_ENV – leaving untouched."
+fi
 
 # ── 5. NetworkManager – ensure it's running ───────────────────────────────────
 info "Enabling NetworkManager …"
