@@ -94,14 +94,38 @@ Hit `Ctrl+C` to stop. Process C exits cleanly on `SIGINT`/`SIGTERM`.
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/` | Captive-portal landing page — serves the HTML credential form. |
 | `GET` | `/health` | Liveness + provisioning status (`already_provisioned: bool`). |
-| `POST` | `/provision` | Submit `{ssid, password, user_id}`. Writes `device.json`, returns `202` with the generated `shelf_id`, then fires the WiFi switch in the background. |
+| `POST` | `/provision` | Submit `{ssid, password, user_id}` as **JSON** or **form-encoded**. Writes `device.json`, returns `202` (with JSON body for JSON callers, HTML success page for form callers), then fires the WiFi switch in the background. |
 | `POST` | `/reset` | (Opt-in) Deletes `device.json`. |
+| `GET` | `/generate_204`, `/gen_204` | Android captive-portal probe (returns non-204 to trigger portal). |
+| `GET` | `/hotspot-detect.html`, `/library/test/success.html` | iOS / macOS captive-portal probes. |
+| `GET` | `/ncsi.txt`, `/connecttest.txt` | Windows captive-portal probes. |
 | `OPTIONS` | `*` | CORS preflight. |
 
 CORS is enabled (`Access-Control-Allow-Origin: *`) because the companion
 app calls Process C from a browser context while connected to the Pi's
 hotspot.
+
+### Captive portal vs JSON API — which to use
+
+There are two valid ways to drive provisioning, depending on what your
+client is:
+
+- **Native app / curl / scripts:** `POST /provision` with
+  `Content-Type: application/json`. Returns JSON. This is what was
+  documented in earlier revisions of this PR and remains the supported
+  contract.
+- **Browser, no app installed:** the user opens `http://192.168.4.1/`
+  (or it auto-pops via captive-portal probes once DNS hijacking is in
+  place). The HTML form there `POST`s to `/provision` as either JSON
+  (preferred, via JS) or `application/x-www-form-urlencoded` (no-JS
+  fallback). Either way the same handler runs; the response format
+  matches the request.
+
+The captive-portal probes only do useful work once `nmcli`/`dnsmasq`
+hijacks DNS for the AP — see `orchestration/shelfaware_network_setup.sh`.
+Until then, users on the hotspot must navigate to `192.168.4.1` manually.
 
 ---
 

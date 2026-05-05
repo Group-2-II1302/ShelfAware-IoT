@@ -30,6 +30,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["process_c"]
 
+# Include captive-portal HTML templates. importlib.resources finds them
+# at runtime via the process_c.templates subpackage (its __init__.py
+# makes hatchling track the directory; this stanza ensures the .html
+# files travel along with the .py).
+[tool.hatch.build.targets.wheel.force-include]
+"process_c/templates/provision.html" = "process_c/templates/provision.html"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
