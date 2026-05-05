@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShelfAware setup</title>
+  <style>
+    /* Self-contained CSS — captive-portal browsers often block external
+       requests, and we have no internet anyway. Keep everything inline.
+       Visual language matches the main ShelfAware web app (light theme,
+       monospace font, soft borders, dark primary button). */
+    :root {
+      --bg: #f3f1ee;
+      --card: #ffffff;
+      --text: #1f1a17;
+      --muted: #6b635c;
+      --border: #d9d4ce;
+      --border-strong: #1f1a17;
+      --primary: #2a2320;
+      --primary-hover: #161210;
+      --error: #b91c1c;
+      --error-bg: #fef2f2;
+      --success: #166534;
+      --success-bg: #f0fdf4;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                   "Liberation Mono", "Courier New", monospace;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem 2rem 1.75rem;
+    }
+    h1 {
+      margin: 0 0 0.5rem;
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    p.subtitle {
+      margin: 0 0 1.75rem;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+    label {
+      display: block;
+      margin-bottom: 1.1rem;
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--text);
+    }
+    input {
+      display: block;
+      width: 100%;
+      margin-top: 0.4rem;
+      padding: 0.7rem 0.85rem;
+      font-size: 1rem;
+      font-family: inherit;
+      color: var(--text);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      transition: border-color 0.15s;
+    }
+    input:focus {
+      outline: none;
+      border-color: var(--border-strong);
+    }
+    input::placeholder { color: var(--muted); opacity: 0.7; }
+    button {
+      width: 100%;
+      margin-top: 0.5rem;
+      padding: 0.85rem;
+      font-size: 1rem;
+      font-family: inherit;
+      font-weight: 600;
+      color: #ffffff;
+      background: var(--primary);
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover:not(:disabled) { background: var(--primary-hover); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #status {
+      margin-top: 1.25rem;
+      padding: 0.85rem 1rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      line-height: 1.45;
+      display: none;
+    }
+    #status.show { display: block; }
+    #status.error {
+      background: var(--error-bg);
+      border: 1px solid var(--error);
+      color: var(--error);
+    }
+    #status.success {
+      background: var(--success-bg);
+      border: 1px solid var(--success);
+      color: var(--success);
+    }
+    .hint {
+      margin: 1.25rem 0 0;
+      font-size: 0.825rem;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>ShelfAware</h1>
+      <p class="subtitle">Connect your shelf to WiFi</p>
+
+      <!-- Native form submission works without JS (form-encoded). The JS
+           below upgrades it to fetch() for a smoother UX, but the page
+           still functions if scripts are blocked. -->
+      <form id="provision-form" method="POST" action="/provision">
+        <label>
+          WiFi network (SSID)
+          <input type="text" name="ssid" required maxlength="32"
+                 autocomplete="off" autocapitalize="off">
+        </label>
+        <label>
+          WiFi password
+          <input type="password" name="password" required minlength="8" maxlength="63">
+        </label>
+        <label>
+          Account ID
+          <input type="text" name="user_id" required
+                 autocomplete="off" autocapitalize="off"
+                 placeholder="paste from the ShelfAware app">
+        </label>
+        <button type="submit" id="submit-btn">Connect</button>
+      </form>
+
+      <div id="status"></div>
+
+      <p class="hint">
+        After tapping Connect, your phone will lose this WiFi network.<br>
+        Reconnect to your home WiFi to finish setup.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    // Progressive enhancement: if JS is available, POST as JSON so we get
+    // structured error responses. If JS is blocked, the form submits as
+    // application/x-www-form-urlencoded — which the /provision handler
+    // also accepts. Either way, the user can finish provisioning.
+    (function () {
+      var form = document.getElementById("provision-form");
+      var status = document.getElementById("status");
+      var btn = document.getElementById("submit-btn");
+
+      function showStatus(kind, message) {
+        status.className = "show " + kind;
+        status.textContent = message;
+      }
+
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        btn.disabled = true;
+        showStatus("", "Sending...");
+
+        var data = {
+          ssid: form.ssid.value,
+          password: form.password.value,
+          user_id: form.user_id.value,
+        };
+
+        try {
+          var res = await fetch("/provision", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data),
+          });
+          var body = await res.json();
+
+          if (res.status === 202) {
+            showStatus(
+              "success",
+              "Accepted. Reconnect your phone to your home WiFi to finish setup."
+            );
+            form.style.display = "none";
+          } else if (res.status === 409) {
+            showStatus(
+              "error",
+              "This shelf is already set up. Use the reset flow if you want to change it."
+            );
+          } else {
+            var detail = body && body.detail
+              ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail))
+              : "Setup failed. Please try again.";
+            showStatus("error", "Error: " + detail);
+            btn.disabled = false;
+          }
+        } catch (err) {
+          showStatus(
+            "error",
+            "Could not reach the shelf. Make sure you're still connected to ShelfAware_Setup."
+          );
+          btn.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
