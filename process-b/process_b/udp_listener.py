@@ -51,26 +51,40 @@ class IncomingReading(BaseModel):
         {
           "shelf_id": "<UUIDv4>",
           "scale_index": <int >= 0>,
-          "est_grams": <finite float>,
-          "sampled_at": "<ISO 8601 UTC string>"
+          "est_grams": <finite float | null>,
+          "sampled_at": "<ISO 8601 UTC string>",
+          "adc_fault": <bool, optional>      // true => sensor unavailable
         }
 
     ``sampled_at`` is kept as a string — the contract specifies ISO 8601
     UTC, and Process B forwards it verbatim to the backend. Round-tripping
     through a ``datetime`` would risk timezone-stripping bugs.
+
+    Fault handling: when ``adc_fault`` is true (or ``est_grams`` is null),
+    Process A is signalling that this sensor was unreadable this cycle.
+    The backend's telemetry schema requires a numeric ``est_grams`` so we
+    cannot forward null readings — they are dropped at the listener with
+    an INFO log. If we later want fault visibility on the frontend, the
+    right place to add it is a separate backend endpoint, not the
+    telemetry stream.
+
+    ``extra="ignore"`` keeps Process B forward-compatible with new
+    diagnostic fields Process A may add (battery, sensor_id, etc.) without
+    requiring a coordinated schema bump on every change.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     shelf_id: str = Field(min_length=1)
     scale_index: int = Field(ge=0)
-    est_grams: float
+    est_grams: float | None = None
     sampled_at: str = Field(min_length=1)
+    adc_fault: bool = False
 
     @field_validator("est_grams")
     @classmethod
-    def _est_grams_must_be_finite(cls, v: float) -> float:
-        if not math.isfinite(v):
+    def _est_grams_must_be_finite(cls, v: float | None) -> float | None:
+        if v is not None and not math.isfinite(v):
             raise ValueError("est_grams must be finite (no NaN, no infinity)")
         return v
 
@@ -102,6 +116,20 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
                     "addr": addr,
                     "reason": exc.reason,
                     "size": len(data),
+                },
+            )
+            return
+
+        # Sensor-fault rows can't be forwarded — backend requires numeric grams.
+        # Log + drop here rather than persist a row that would never drain.
+        if reading.adc_fault or reading.est_grams is None:
+            logger.info(
+                "udp datagram skipped (sensor fault)",
+                extra={
+                    "addr": addr,
+                    "shelf_id": reading.shelf_id,
+                    "scale_index": reading.scale_index,
+                    "adc_fault": reading.adc_fault,
                 },
             )
             return

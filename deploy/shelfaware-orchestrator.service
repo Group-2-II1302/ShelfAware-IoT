@@ -1,0 +1,77 @@
+# /etc/systemd/system/shelfaware-orchestrator.service
+#
+# ShelfAware Boot Orchestrator
+# ════════════════════════════
+# Install and enable:
+#   sudo cp shelfaware-orchestrator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable shelfaware-orchestrator.service
+#
+# ⚠️  TAILSCALE WARNING: Enabling and starting this service will invoke
+#     the orchestrator which calls nmcli. Only enable when physically
+#     present at the Pi or when Tailscale access is not required.
+#     During development, use SHELFAWARE_DEV=1 and run orchestrator.py
+#     directly instead of via systemd.
+#
+# Check logs:
+#   journalctl -fu shelfaware-orchestrator
+#   tail -f /var/log/shelfaware_orchestrator.log
+
+[Unit]
+Description=ShelfAware Boot Orchestrator
+Documentation=file:///opt/shelfaware/README.md
+
+# Hard dependency – if NM dies, we stop too (no ghost state)
+Requires=NetworkManager.service
+After=NetworkManager.service
+
+# Belt-and-suspenders for slow DHCP boot environments
+Wants=network-online.target
+After=network-online.target
+
+After=time-sync.target
+
+[Service]
+Type=simple
+
+User=root
+Group=root
+
+# Unset DEV mode in production – explicitly enforce it
+Environment="SHELFAWARE_DEV=0"
+Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Process B reads its config from env vars (PI_API_KEY, BACKEND_URL,
+# SHELF_IDS, DB_PATH, ...). The orchestrator inherits this environment
+# and passes it through to Process B when it spawns it as a subprocess.
+# The file is created by deploy/install.sh; operator fills in real values.
+EnvironmentFile=/etc/shelfaware/process-b.env
+
+WorkingDirectory=/opt/shelfaware
+ExecStart=/usr/bin/python3 /opt/shelfaware/orchestration/orchestrator.py
+
+# systemd creates /var/lib/shelfaware with correct permissions before launch
+StateDirectory=shelfaware
+StateDirectoryMode=0750
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shelfaware-orchestrator
+
+# Restart on failure, not on clean exit (clean exit = intentional stop)
+Restart=on-failure
+RestartSec=10
+
+# Max 3 restarts per 60 s – prevents CPU-hogging boot loops
+StartLimitIntervalSec=60
+StartLimitBurst=3
+StartLimitAction=none
+
+# Kill entire cgroup (all child processes) on stop
+KillMode=control-group
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+

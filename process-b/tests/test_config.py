@@ -6,6 +6,9 @@ These are pure-function tests over a synthetic env mapping. We never touch
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from process_b.config import Config, ConfigError
@@ -15,8 +18,19 @@ SHELF_A = "550e8400-e29b-41d4-a716-446655440000"
 SHELF_B = "660e8400-e29b-41d4-a716-446655440001"
 
 
-def _minimal_env(**overrides: str) -> dict[str, str]:
-    """Return a valid env mapping; tests override individual keys."""
+def _minimal_env(*, tmp_path: Path | None = None, **overrides: str) -> dict[str, str]:
+    """Return a valid env mapping; tests override individual keys.
+
+    ``DEVICE_FILE_PATH`` is pointed at a guaranteed-nonexistent path inside
+    ``tmp_path`` (or a fixed garbage path) so happy-path tests exercise the
+    env-fallback branch deterministically. Tests that want to drive the
+    device.json branch must override ``DEVICE_FILE_PATH`` themselves.
+    """
+    if tmp_path is not None:
+        device_file = str(tmp_path / "absent-device.json")
+    else:
+        device_file = "/nonexistent/device.json"
+
     env = {
         "PI_API_KEY": "secret",
         "BACKEND_URL": "https://api.example.com/",
@@ -24,6 +38,7 @@ def _minimal_env(**overrides: str) -> dict[str, str]:
         "SHELF_IDS": SHELF_A,
         "UDP_LISTEN_PORT": "5005",
         "PROC_A_CONTROL_PORT": "5006",
+        "DEVICE_FILE_PATH": device_file,
     }
     env.update(overrides)
     return env
@@ -48,6 +63,9 @@ class TestHappyPath:
         assert cfg.poll_interval_sec == pytest.approx(3.0)
 
         assert cfg.log_level == "INFO"
+        # No device.json present → user_id stays None and shelf_ids comes
+        # from the env var (legacy / pre-provisioning path).
+        assert cfg.user_id is None
 
     def test_optionals_when_provided_override_defaults(self) -> None:
         cfg = Config.from_env(
@@ -118,3 +136,74 @@ class TestErrors:
         with pytest.raises(ConfigError) as exc:
             Config.from_env(_minimal_env(SHELF_IDS=" , , "))
         assert "SHELF_IDS" in str(exc.value)
+
+
+class TestDeviceFile:
+    """Behaviour around DEVICE_FILE_PATH and the shelf_id precedence rule."""
+
+    def _write_device_json(
+        self, path: Path, *, user_id: str = "user-uuid-1", shelf_id: str = SHELF_B
+    ) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "user_id": user_id,
+                    "shelf_id": shelf_id,
+                    "provisioned_at": "2026-05-04T07:00:00Z",
+                    "schema_version": 1,
+                }
+            )
+        )
+
+    def test_device_json_wins_over_env_shelf_ids(self, tmp_path: Path) -> None:
+        device_path = tmp_path / "device.json"
+        self._write_device_json(device_path, user_id="u-from-file", shelf_id=SHELF_B)
+
+        cfg = Config.from_env(
+            _minimal_env(
+                tmp_path=tmp_path,
+                DEVICE_FILE_PATH=str(device_path),
+                SHELF_IDS=SHELF_A,  # should be ignored
+            )
+        )
+
+        assert cfg.shelf_ids == (SHELF_B,)
+        assert cfg.user_id == "u-from-file"
+        assert cfg.device_file_path == str(device_path)
+
+    def test_no_device_json_falls_back_to_env(self, tmp_path: Path) -> None:
+        # _minimal_env points DEVICE_FILE_PATH at an absent file under tmp_path.
+        cfg = Config.from_env(_minimal_env(tmp_path=tmp_path))
+        assert cfg.shelf_ids == (SHELF_A,)
+        assert cfg.user_id is None
+
+    def test_no_device_json_and_no_env_shelf_ids_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        env = _minimal_env(tmp_path=tmp_path)
+        del env["SHELF_IDS"]
+        with pytest.raises(ConfigError) as exc:
+            Config.from_env(env)
+        # Error message should be helpful — mention both alternatives.
+        assert "SHELF_IDS" in str(exc.value)
+        assert "device.json" in str(exc.value)
+
+    def test_malformed_device_json_is_rejected_loudly(self, tmp_path: Path) -> None:
+        device_path = tmp_path / "device.json"
+        device_path.write_text("not valid json")
+
+        with pytest.raises(ConfigError) as exc:
+            Config.from_env(
+                _minimal_env(tmp_path=tmp_path, DEVICE_FILE_PATH=str(device_path))
+            )
+        # Don't silently fall back to env when device.json is corrupt —
+        # operator must look.
+        assert "DEVICE_FILE_PATH" in str(exc.value)
+
+    def test_device_file_path_default(self, tmp_path: Path) -> None:
+        # When DEVICE_FILE_PATH is unset, default is /etc/shelfaware/device.json.
+        # (Almost certainly absent on the test box; use the env-fallback path.)
+        env = _minimal_env(tmp_path=tmp_path)
+        del env["DEVICE_FILE_PATH"]
+        cfg = Config.from_env(env)
+        assert cfg.device_file_path == "/etc/shelfaware/device.json"

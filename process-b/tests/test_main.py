@@ -48,6 +48,8 @@ def _make_config(tmp_path: Path, *, udp_port: int) -> Config:
         backend_url=BASE_URL,
         db_path=str(tmp_path / "outbox.db"),
         shelf_ids=(SHELF_A,),
+        user_id=None,  # legacy / dev path: no device.json, skip registration
+        device_file_path=str(tmp_path / "device.json"),
         udp_listen_host="127.0.0.1",
         udp_listen_port=udp_port,
         proc_a_control_host="127.0.0.1",
