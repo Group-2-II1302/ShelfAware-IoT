@@ -28,8 +28,12 @@ from aiohttp import web
 from process_c import logging_setup
 from process_c.config import Config, ConfigError
 from process_c.handlers import (
+    captive_probe_android,
+    captive_probe_apple,
+    captive_probe_windows,
     cors_middleware,
     make_health_handler,
+    make_index_handler,
     make_provision_handler,
     make_reset_handler,
 )
@@ -87,8 +91,21 @@ def build_app(cfg: Config, wifi: WifiBackend) -> web.Application:
     """Construct the aiohttp Application. Exposed for tests."""
     app = web.Application(middlewares=[cors_middleware])
 
+    # Captive-portal landing page (HTML form). GET / is what OS captive
+    # portal browsers will hit after DNS hijacking redirects them here.
+    app.router.add_get("/", make_index_handler(cfg))
+
     app.router.add_get("/health", make_health_handler(cfg))
     app.router.add_post("/provision", make_provision_handler(cfg, wifi))
+
+    # OS captive-portal probes. Trigger the OS to pop its captive-portal
+    # browser when DNS hijacking is in place. Harmless no-ops otherwise.
+    app.router.add_get("/generate_204", captive_probe_android)  # Android
+    app.router.add_get("/gen_204", captive_probe_android)  # Android (older path)
+    app.router.add_get("/hotspot-detect.html", captive_probe_apple)  # iOS / macOS
+    app.router.add_get("/library/test/success.html", captive_probe_apple)  # iOS variant
+    app.router.add_get("/ncsi.txt", captive_probe_windows)  # Windows
+    app.router.add_get("/connecttest.txt", captive_probe_windows)  # Windows 10+
 
     if cfg.allow_reset_endpoint:
         app.router.add_post("/reset", make_reset_handler(cfg))

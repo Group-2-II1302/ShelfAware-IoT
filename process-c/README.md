@@ -27,11 +27,31 @@ when it switches to online mode.
 
 ## Endpoints
 
-| Method | Path        | Purpose                                    |
-| ------ | ----------- | ------------------------------------------ |
-| GET    | `/health`   | Frontend probe to detect "I'm on a Pi"     |
-| POST   | `/provision`| Submit WiFi creds + user_id                |
-| POST   | `/reset`    | (debug) wipe device.json — disabled by default |
+| Method | Path                          | Purpose                                                              |
+| ------ | ----------------------------- | -------------------------------------------------------------------- |
+| GET    | `/`                           | Captive-portal landing page (HTML credential form)                   |
+| GET    | `/health`                     | Frontend probe to detect "I'm on a Pi"                               |
+| POST   | `/provision`                  | Submit WiFi creds + user_id (JSON or form-encoded)                   |
+| POST   | `/reset`                      | (debug) wipe device.json — disabled by default                       |
+| GET    | `/generate_204`, `/gen_204`   | Android captive-portal probe                                         |
+| GET    | `/hotspot-detect.html` (+ variant) | iOS / macOS captive-portal probe                                |
+| GET    | `/ncsi.txt`, `/connecttest.txt`    | Windows captive-portal probe                                    |
+
+There are two ways for a client to drive `POST /provision`:
+
+- **JSON** (`Content-Type: application/json`) — used by the in-page
+  JavaScript and by native apps / curl. Returns `202` with a JSON body
+  `{"status":"accepted","shelf_id":"..."}` on success.
+- **Form-encoded** (`Content-Type: application/x-www-form-urlencoded`)
+  — used as the no-JS fallback when the user submits the HTML form
+  directly. Returns the same `202` but renders an HTML success page so
+  the user sees a friendly confirmation rather than raw JSON.
+
+The captive-portal probes deliberately **fail** each OS's "is there real
+internet?" check so that, when paired with AP-side DNS hijacking (in
+`shelfaware_network_setup.sh`), the OS auto-pops its captive-portal
+browser pointed at `/`. Without DNS hijacking the probes are dead code —
+the OS never reaches them — but they're cheap to keep ready.
 
 See `process_c/handlers.py` for full request/response schemas.
 
