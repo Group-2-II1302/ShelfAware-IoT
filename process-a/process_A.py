@@ -112,6 +112,12 @@ class SystemConfig:
     # CPU Governor
     governor_active:     str   = "performance"
     governor_idle:       str   = "ondemand"
+    # Experimental variables
+    creep_alpha:         float = 0.00005
+    stable_threshold_g:  float = 2.0
+    stable_time_s:       float = 1800.0
+    creep_max_adc:       float = 8000.0
+    long_window_size:    int   =180
 
 
 CONFIG = SystemConfig()
@@ -313,6 +319,14 @@ class MovingAverage:
         self.buffer.append(value)
         self.running_sum += value
         return self.running_sum / len(self.buffer)
+    
+class LongTermAverage:
+    def __init__(self, size: int):
+        self.buffer = deque(maxlen=size)
+
+    def add(self, value: float) -> float:
+        self.buffer.append(value)
+        return sum(self.buffer) / len(self.buffer)
 
 
 class PersistentDriftCompensator:
@@ -361,12 +375,51 @@ class PersistentDriftCompensator:
                 self._save_baseline(filtered_adc)
         return max(0.0, filtered_adc - self._baseline)
 
+# Experimental drift algo
+class CreepCompensator:
+    def __init__(self):
+        self._creep_offset = 0.0
+        self._stable_since: Optional[float] = None
+    
+    def correct(
+            self,
+            smoothed_adc: float,
+            long_term_adc: float,
+            delta_grams: float,
+    ) -> float:
+        
+        now = time.time()
+
+        if delta_grams < CONFIG.stable_threshold_g:
+            if self._stable_since is None:
+                self._stable_since = now
+        else:
+            self._stable_since = None
+        
+        stable_duration = (
+            0
+            if self._stable_since is None
+            else now - self._stable_since
+        )
+
+        if stable_duration > CONFIG.stable_time_s:
+            observed_drift = long_term_adc - smoothed_adc
+
+            self._creep_offset += (
+                observed_drift * CONFIG.creep_alpha
+            )
+
+            self._creep_offset = min(
+                self._creep_offset,
+                CONFIG.creep_max_adc
+            )
+        return max(0.0, smoothed_adc - self._creep_offset)
+
 
 def adc_to_grams(adc: float, cfg: SensorConfig) -> float:
     if adc <= 0:
         return 0.0
     return (adc / cfg.a_const) ** (1.0 / cfg.b_const)
-
 
 # ------------------------------------------------------------------------------
 # Per-sensor fault tracker
@@ -422,12 +475,16 @@ def main() -> None:
 
     # Per-sensor objects
     filters:        Dict[str, MovingAverage]              = {}
+    long_filters:   Dict[str, LongTermAverage]            = {}
     compensators:   Dict[str, PersistentDriftCompensator] = {}
+    creep_compensators: Dict[str, CreepCompensator]       = {}
     fault_trackers: Dict[str, SensorFaultTracker]         = {}
     channels:       Dict[str, Optional[AnalogIn]]         = {}
 
     for s_id, cfg in SENSOR_MAP.items():
         filters[s_id]        = MovingAverage(CONFIG.window_size)
+        long_filters[s_id]   = LongTermAverage(CONFIG.long_window_size)
+        creep_compensators[s_id] = CreepCompensator()
         compensators[s_id]   = PersistentDriftCompensator(s_id)
         fault_trackers[s_id] = SensorFaultTracker(s_id)
         channels[s_id]       = HardwareManager.get_adc_channel(
@@ -440,7 +497,7 @@ def main() -> None:
     log.info("Initialisation complete. Entering read loop.")
 
     # Delta-Based Activity State
-    previous_grams:   Dict[str, float] = {s: 0.0 for s in SENSOR_SEQUENCE}
+    previous_grams:   Dict[str, Optional[float]] = {s: None for s in SENSOR_SEQUENCE}
     last_activity_ts: float            = 0.0
 
     while True:
@@ -474,23 +531,40 @@ def main() -> None:
                 raw_val   = channel.value
                 clean     = 0 if raw_val < CONFIG.deadzone_adc else raw_val
                 smoothed  = filters[s_id].add(float(clean))
-                corrected = compensators[s_id].correct(smoothed)
-                grams     = adc_to_grams(corrected, cfg)
+                baseline_corrected = compensators[s_id].correct(smoothed)
+                long_term = long_filters[s_id].add(baseline_corrected)
 
-                fault_trackers[s_id].record_success()
+                grams = adc_to_grams(baseline_corrected, cfg)
+                long_term_g = adc_to_grams(long_term, cfg)
+
+                prev_g = previous_grams[s_id]
+
+                delta_g = abs(grams - prev_g) if prev_g is not None else 0.0
+                
+                creep_corrected_adc = creep_compensators[s_id].correct(
+                    baseline_corrected,
+                    long_term,
+                    delta_g,
+                )
+
+                grams = adc_to_grams(creep_corrected_adc, cfg)
+
+                previous_grams[s_id] = grams
 
                 # Delta-Based Activity Trigger
-                delta = abs(grams - previous_grams[s_id])
-                if delta > CONFIG.change_threshold_g:
+                if delta_g > CONFIG.change_threshold_g:
                     last_activity_ts = time.time()
-                    log.debug("[%s] Activity: delta=%.1fg (%.1f->%.1f). Cooldown reset.",
-                              s_id, delta, previous_grams[s_id], grams)
-                previous_grams[s_id] = grams
+                    log.debug(
+                        "[%s] Activity: delta=%.1fg (%.1f->%.1f). Cooldown reset.",
+                        s_id, delta_g, prev_g, grams
+                    )
+                
+                fault_trackers[s_id].record_success()
 
                 print(
                     f"[{mode_label}] [{s_id}({zone}|idx={scale_index})] "
-                    f"ADC:{raw_val:5}  Corr:{corrected:7.1f}  "
-                    f"g:{grams:7.2f}  d:{delta:6.1f}g"
+                    f"ADC:{raw_val:5}  Corr:{baseline_corrected:7.1f}  "
+                    f"g:{grams:7.2f}  d:{delta_g:6.1f}g"
                 )
 
                 payload = {
