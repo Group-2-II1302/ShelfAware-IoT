@@ -1,0 +1,468 @@
+[1mdiff --git a/deploy/install.sh b/deploy/install.sh[m
+[1mold mode 100644[m
+[1mnew mode 100755[m
+[1mindex 3d84773..82a6f5c[m
+[1m--- a/deploy/install.sh[m
+[1m+++ b/deploy/install.sh[m
+[36m@@ -1,16 +1,16 @@[m
+ #!/usr/bin/env bash[m
+ # =============================================================================[m
+[31m-# install.sh  –  ShelfAware deployment script[m
+[32m+[m[32m# install.sh  –  ShelfAware deployment script (Refactored)[m
+ # =============================================================================[m
+ # Run once on a freshly flashed Raspberry Pi OS Bookworm (headless).[m
+ # Idempotent – safe to re-run.[m
+ #[m
+ # ⚠️  TAILSCALE WARNING: This script calls nmcli and systemctl which will[m
+[31m-#     modify NetworkManager and may sever your remote connection.[m
+[31m-#     Run from a local terminal or physical keyboard/monitor only.[m
+[32m+[m[32m#      modify NetworkManager and may sever your remote connection.[m
+[32m+[m[32m#      Run from a local terminal or physical keyboard/monitor only.[m
+ #[m
+ # Usage:[m
+[31m-#   sudo bash install.sh[m
+[32m+[m[32m#    sudo bash install.sh[m
+ # =============================================================================[m
+ [m
+ set -euo pipefail[m
+[36m@@ -25,28 +25,39 @@[m [mfatal() { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }[m
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"[m
+ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"[m
+ INSTALL_DIR="/opt/shelfaware"[m
+[32m+[m[32mVENV_DIR="$INSTALL_DIR/venv"[m
+ SERVICE_FILE="shelfaware-orchestrator.service"[m
+ [m
+ # ── 1. Dependencies ──────────────────────────────────────────────────────────[m
+ info "Installing system dependencies …"[m
+ apt-get update -qq[m
+ apt-get install -y --no-install-recommends \[m
+[31m-    python3 python3-pip network-manager iproute2 iputils-ping[m
+[32m+[m[32m    python3 python3-pip python3-venv network-manager iproute2 iputils-ping[m
+ [m
+[31m-# ── 2. Install Python deps ────────────────────────────────────────────────────[m
+[31m-info "Installing Python packages …"[m
+[32m+[m[32m# ── 2. Create Virtual Environment ─────────────────────────────────────────────[m
+[32m+[m[32minfo "Setting up Python virtual environment at $VENV_DIR …"[m
+[32m+[m[32mmkdir -p "$INSTALL_DIR"[m
+[32m+[m[32mif [[ ! -d "$VENV_DIR" ]]; then[m
+[32m+[m[32m    python3 -m venv "$VENV_DIR"[m
+[32m+[m[32mfi[m
+[32m+[m
+[32m+[m[32m# Define our localized pip and python runtimes[m
+[32m+[m[32mVENV_PIP="$VENV_DIR/bin/pip"[m
+[32m+[m[32mVENV_PYTHON="$VENV_DIR/bin/python3"[m
+[32m+[m
+[32m+[m[32m# Upgrade pip inside the virtual environment[m
+[32m+[m[32minfo "Upgrading virtual environment pip …"[m
+[32m+[m[32m"$VENV_PIP" install --upgrade --quiet pip[m
+[32m+[m
+[32m+[m[32m# ── 3. Install Python deps ────────────────────────────────────────────────────[m
+[32m+[m[32minfo "Installing core system Python packages in venv …"[m
+ [m
+ # Process A: hardware drivers[m
+[31m-pip3 install --break-system-packages --quiet \[m
+[32m+[m[32m"$VENV_PIP" install --quiet \[m
+     adafruit-blinka \[m
+     adafruit-circuitpython-ads1x15[m
+ [m
+[31m-# Process B's runtime deps are installed in section 3 below, AFTER its[m
+[31m-# source has been staged to $INSTALL_DIR. Installing here would either[m
+[31m-# pin to the repo working tree (wrong: /opt is the source of truth in[m
+[31m-# production) or fail (no pyproject.toml in $INSTALL_DIR yet).[m
+[31m-[m
+[31m-# ── 3. Deploy application files ───────────────────────────────────────────────[m
+[32m+[m[32m# ── 4. Deploy application files ───────────────────────────────────────────────[m
+ info "Deploying application to $INSTALL_DIR …"[m
+ mkdir -p "$INSTALL_DIR/orchestration"[m
+ mkdir -p "$INSTALL_DIR/process-a"[m
+[36m@@ -72,12 +83,10 @@[m [mif [[ -f "$REPO_ROOT/process-b/README.md" ]]; then[m
+     cp "$REPO_ROOT/process-b/README.md" "$INSTALL_DIR/process-b/"[m
+ fi[m
+ [m
+[31m-info "Installing Process B's Python dependencies …"[m
+[31m-pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-b"[m
+[32m+[m[32minfo "Installing Process B's Python dependencies into venv …"[m
+[32m+[m[32m"$VENV_PIP" install --quiet -e "$INSTALL_DIR/process-b"[m
+ [m
+ # Process C: stage source AND pyproject so we can pip install from $INSTALL_DIR.[m
+[31m-# The orchestrator launches it via /opt/shelfaware/process-c/process_c.py[m
+[31m-# (a small shim that forwards to process_c.main:run on the installed package).[m
+ if [[ -d "$REPO_ROOT/process-c/process_c" ]]; then[m
+     cp -r "$REPO_ROOT/process-c/process_c/." "$INSTALL_DIR/process-c/process_c/"[m
+     cp    "$REPO_ROOT/process-c/pyproject.toml" "$INSTALL_DIR/process-c/"[m
+[36m@@ -87,8 +96,8 @@[m [mif [[ -d "$REPO_ROOT/process-c/process_c" ]]; then[m
+     cp "$REPO_ROOT/process-c/process_c.py" "$INSTALL_DIR/process-c/process_c.py"[m
+     chmod 755 "$INSTALL_DIR/process-c/process_c.py"[m
+ [m
+[31m-    info "Installing Process C's Python dependencies …"[m
+[31m-    pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-c"[m
+[32m+[m[32m    info "Installing Process C's Python dependencies into venv …"[m
+[32m+[m[32m    "$VENV_PIP" install --quiet -e "$INSTALL_DIR/process-c"[m
+ else[m
+     warn "process-c package not found – creating placeholder stub."[m
+     cat > "$INSTALL_DIR/process-c/process_c.py" <<STUB[m
+[36m@@ -103,18 +112,14 @@[m [mSTUB[m
+     chmod 755 "$INSTALL_DIR/process-c/process_c.py"[m
+ fi[m
+ [m
+[31m-# ── 4. State and log directories ──────────────────────────────────────────────[m
+[32m+[m[32m# ── 5. State and log directories ──────────────────────────────────────────────[m
+ mkdir -p /var/lib/shelfaware[m
+ chmod 750 /var/lib/shelfaware[m
+ [m
+ touch /var/log/shelfaware_orchestrator.log[m
+ chmod 640 /var/log/shelfaware_orchestrator.log[m
+ [m
+[31m-# ── 4b. Process B environment file ────────────────────────────────────────────[m
+[31m-# Process B reads PI_API_KEY, BACKEND_URL, SHELF_IDS, DB_PATH, etc. from env.[m
+[31m-# The systemd unit loads them from /etc/shelfaware/process-b.env.[m
+[31m-# If the file doesn't already exist, drop a template that the operator must[m
+[31m-# fill in BEFORE the orchestrator first launches Process B.[m
+[32m+[m[32m# ── 5b. Process B environment file ────────────────────────────────────────────[m
+ mkdir -p /etc/shelfaware[m
+ chmod 750 /etc/shelfaware[m
+ [m
+[36m@@ -127,8 +132,8 @@[m [mif [[ ! -f "$PROCESS_B_ENV" ]]; then[m
+         cat > "$PROCESS_B_ENV" <<'ENV_TEMPLATE'[m
+ # Process B environment file. Loaded by the orchestrator's systemd unit.[m
+ # Fill in real values before starting shelfaware-orchestrator.[m
+[31m-PI_API_KEY=changeme[m
+[31m-BACKEND_URL=https://shelfaware-backend.example.workers.dev[m
+[32m+[m[32mPI_API_KEY=cZBCSoScC4tLXIeqkP3yCtsUTFb6x9YH[m
+[32m+[m[32mBACKEND_URL=https://shelfaware-backend.emanuel-diktonius.workers.dev/[m
+ SHELF_IDS=00000000-0000-0000-0000-000000000000[m
+ DB_PATH=/var/lib/shelfaware/process-b.sqlite[m
+ UDP_LISTEN_HOST=127.0.0.1[m
+[36m@@ -143,7 +148,7 @@[m [melse[m
+     info "Process B env file already exists at $PROCESS_B_ENV – leaving untouched."[m
+ fi[m
+ [m
+[31m-# ── 5. NetworkManager – ensure it's running ───────────────────────────────────[m
+[32m+[m[32m# ── 6. NetworkManager – ensure it's running ───────────────────────────────────[m
+ info "Enabling NetworkManager …"[m
+ systemctl enable NetworkManager[m
+ systemctl start  NetworkManager[m
+[36m@@ -153,13 +158,18 @@[m [mfor i in {1..10}; do[m
+     warn "Waiting for nmcli ($i/10) …"; sleep 2[m
+ done[m
+ [m
+[31m-# ── 6. Pre-configure the AP hotspot profile ───────────────────────────────────[m
+[32m+[m[32m# ── 7. Pre-configure the AP hotspot profile ───────────────────────────────────[m
+ info "Configuring AP hotspot profile …"[m
+[32m+[m[32m# Explicitly use the venv python interpreter when executing setup dependencies if any[m
+ bash "$INSTALL_DIR/orchestration/shelfaware_network_setup.sh"[m
+ [m
+[31m-# ── 7. Install and enable the systemd service ─────────────────────────────────[m
+[32m+[m[32m# ── 8. Install and enable the systemd service ─────────────────────────────────[m
+ info "Installing systemd service …"[m
+ cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/[m
+[32m+[m
+[32m+[m[32m# Update the service file to use our local venv Python executable instead of global python3[m
+[32m+[m[32msed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|g" "/etc/systemd/system/$SERVICE_FILE"[m
+[32m+[m
+ systemctl daemon-reload[m
+ systemctl enable "$SERVICE_FILE"[m
+ [m
+[1mdiff --git a/orchestration/orchestrator.py b/orchestration/orchestrator.py[m
+[1mindex db1c22d..0eb096c 100644[m
+[1m--- a/orchestration/orchestrator.py[m
+[1m+++ b/orchestration/orchestrator.py[m
+[36m@@ -56,6 +56,10 @@[m [melse:[m
+     PROCESS_B_CMD = [sys.executable, "/opt/shelfaware/process-b/process_b/main.py"][m
+     PROCESS_C_CMD = [sys.executable, "/opt/shelfaware/process-c/process_c.py"][m
+ [m
+[32m+[m[32mPROCESS_A_PATTERN = "process-a/process_A.py"[m
+[32m+[m[32mPROCESS_B_PATTERN = "process-b/process_b/main.py"[m
+[32m+[m[32mPROCESS_C_PATTERN = "process-c/process_c.py"[m
+[32m+[m
+ PING_HOST        = "8.8.8.8"[m
+ PING_TIMEOUT_SEC = 10[m
+ PING_COUNT       = 3[m
+[36m@@ -248,9 +252,11 @@[m [mdef _kill_group(*names: str) -> None:[m
+ def _launch_process(name: str, cmd: list[str]) -> Optional[subprocess.Popen]:[m
+     log.info("Launching Process %s: %s", name, " ".join(cmd))[m
+     try:[m
+[32m+[m[32m        log_path = f"/var/log/shelfaware_proc_{name.lower()}.log"[m
+[32m+[m[32m        log_fh = open(log_path, "ab", buffering=0)[m
+         proc = subprocess.Popen([m
+             cmd,[m
+[31m-            stdout=subprocess.PIPE,[m
+[32m+[m[32m            stdout=log_fh,[m
+             stderr=subprocess.STDOUT,[m
+             start_new_session=True,[m
+         )[m
+[36m@@ -267,11 +273,72 @@[m [mdef _launch_process(name: str, cmd: list[str]) -> Optional[subprocess.Popen]:[m
+     _running[name] = None[m
+     return None[m
+ [m
+[32m+[m[32mdef _kill_orphans() -> None:[m
+[32m+[m[32m    """Kill any leftover process_a/b/c instances from previous orchestrator runs.[m
+[32m+[m
+[32m+[m[32m    Called at startup before any launches. Without this, an unclean shutdown[m
+[32m+[m[32m    of a previous orchestrator session can leave Process A/B/C running outside[m
+[32m+[m[32m    our cgroup, causing port conflicts and double-instances when we relaunch.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    if DEV_MODE:[m
+[32m+[m[32m        log.info("[DEV MODE] skipping orphan cleanup")[m
+[32m+[m[32m        return[m
+[32m+[m
+[32m+[m[32m    patterns = [[m
+[32m+[m[32m        "process-b/process_b/main.py",[m
+[32m+[m[32m        "process-a/process_A.py",[m
+[32m+[m[32m        "process-c/process_c.py",[m
+[32m+[m[32m    ][m
+[32m+[m[32m    for pat in patterns:[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            result = subprocess.run([m
+[32m+[m[32m                ["pgrep", "-f", pat],[m
+[32m+[m[32m                capture_output=True, text=True, timeout=5,[m
+[32m+[m[32m            )[m
+[32m+[m[32m            if result.returncode == 0 and result.stdout.strip():[m
+[32m+[m[32m                pids = result.stdout.strip().split()[m
+[32m+[m[32m                log.warning("Found orphaned %s (pids=%s); killing.", pat, pids)[m
+[32m+[m[32m                subprocess.run(["pkill", "-9", "-f", pat], timeout=5)[m
+[32m+[m[32m        except Exception as exc:[m
+[32m+[m[32m            log.warning("Orphan check for %s failed: %s", pat, exc)[m
+[32m+[m
+[32m+[m[32m    time.sleep(2)[m
+ [m
+ # ──────────────────────────────────────────────[m
+ # NetworkManager / AP helpers[m
+ # ──────────────────────────────────────────────[m
+ [m
+[32m+[m[32mdef _kill_by_pattern(pattern: str) -> None:[m
+[32m+[m[32m    """Kill any process whose cmdline matches ``pattern``. No-op if none.[m
+[32m+[m
+[32m+[m[32m    Used as defence-in-depth before launching A/B/C. If a previous orchestrator[m
+[32m+[m[32m    session left an orphan that we haven't tracked in ``_running``, this[m
+[32m+[m[32m    ensures we don't race against it for a port (e.g. UDP 5005 for B).[m
+[32m+[m[32m    """[m
+[32m+[m[32m    if DEV_MODE:[m
+[32m+[m[32m        return[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        result = subprocess.run([m
+[32m+[m[32m            ["pgrep", "-f", pattern],[m
+[32m+[m[32m            capture_output=True, text=True, timeout=5,[m
+[32m+[m[32m        )[m
+[32m+[m[32m        if result.returncode == 0 and result.stdout.strip():[m
+[32m+[m[32m            pids = result.stdout.strip().split()[m
+[32m+[m[32m            log.warning([m
+[32m+[m[32m                "Killing stale process matching %r (pids=%s) before relaunch.",[m
+[32m+[m[32m                pattern, pids,[m
+[32m+[m[32m            )[m
+[32m+[m[32m            subprocess.run(["pkill", "-9", "-f", pattern], timeout=5)[m
+[32m+[m[32m            time.sleep(1)[m
+[32m+[m[32m    except Exception as exc:[m
+[32m+[m[32m        log.warning("Stale-process kill for %r failed: %s", pattern, exc)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _safe_launch(name: str, cmd: list[str], pattern: str) -> Optional[subprocess.Popen]:[m
+[32m+[m[32m    """Kill any orphan matching ``pattern`` then launch. See :func:`_kill_by_pattern`."""[m
+[32m+[m[32m    _kill_by_pattern(pattern)[m
+[32m+[m[32m    return _launch_process(name, cmd)[m
+[32m+[m
+ def _nmcli(*args: str, timeout: int = 15) -> subprocess.CompletedProcess:[m
+     cmd = ["nmcli"] + list(args)[m
+     log.debug("nmcli cmd: %s", " ".join(cmd))[m
+[36m@@ -315,15 +382,22 @@[m [mdef switch_to_ap_mode() -> bool:[m
+ [m
+ def run_online_mode() -> None:[m
+     log.info("=== ONLINE MODE ===")[m
+[31m-    _kill_group("B", "C")[m
+[32m+[m[32m    _kill_group("C")[m
+ [m
+     if _running["A"] and _running["A"].poll() is None:[m
+[31m-        log.info("Process A already running (PID %d) – no action needed.",[m
+[31m-                 _running["A"].pid)[m
+[31m-        return[m
+[32m+[m[32m        log.info("Process A already running (PID %d).", _running["A"].pid)[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        _safe_launch("A", PROCESS_A_CMD, PROCESS_A_PATTERN)[m
+ [m
+[31m-    _launch_process("A", PROCESS_A_CMD)[m
+[32m+[m[32m    # Always restart B on entry to online mode so the registrar gets a[m
+[32m+[m[32m    # fresh attempt with the (now-reachable) backend. The registrar runs[m
+[32m+[m[32m    # once at B startup; if it gave up during the offline phase (or is[m
+[32m+[m[32m    # mid-backoff), the only reliable way to retrigger is a clean restart.[m
+ [m
+[32m+[m[32m    if _running["B"] and _running["B"].poll() is None:[m
+[32m+[m[32m        log.info("Restarting Process B (PID %d) to refresh registrar.", _running["B"].pid)[m
+[32m+[m[32m        _kill_process("B")[m
+[32m+[m[32m    _safe_launch("B", PROCESS_B_CMD, PROCESS_B_PATTERN)[m
+ [m
+ def run_offline_mode() -> None:[m
+     log.info("=== OFFLINE / SETUP MODE ===")[m
+[36m@@ -336,11 +410,11 @@[m [mdef run_offline_mode() -> None:[m
+     time.sleep(3)[m
+ [m
+     if not (_running["C"] and _running["C"].poll() is None):[m
+[31m-        _launch_process("C", PROCESS_C_CMD)[m
+[32m+[m[32m        _safe_launch("C", PROCESS_C_CMD, PROCESS_C_PATTERN)[m
+         time.sleep(2)[m
+ [m
+     if not (_running["B"] and _running["B"].poll() is None):[m
+[31m-        _launch_process("B", PROCESS_B_CMD)[m
+[32m+[m[32m        _safe_launch("B", PROCESS_B_CMD, PROCESS_B_PATTERN)[m
+ [m
+ [m
+ def main() -> None:[m
+[36m@@ -353,6 +427,8 @@[m [mdef main() -> None:[m
+             "short-circuited. Safe for Tailscale / hotspot development."[m
+         )[m
+ [m
+[32m+[m[32m    _kill_orphans()[m
+[32m+[m
+     state = _load_state()[m
+ [m
+     if state["consecutive_failures"] >= MAX_FAILURES:[m
+[1mdiff --git a/orchestration/wifi_connector.py b/orchestration/wifi_connector.py[m
+[1mindex 5f4d2ce..f5997a3 100644[m
+[1m--- a/orchestration/wifi_connector.py[m
+[1m+++ b/orchestration/wifi_connector.py[m
+[36m@@ -80,29 +80,48 @@[m [mdef _is_connected_to_sta() -> bool:[m
+                 return True[m
+     return False[m
+ [m
+[31m-[m
+ def _create_or_update_sta_profile(ssid: str, password: str) -> bool:[m
+[31m-    if _connection_exists(STA_PROFILE_NAME):[m
+[31m-        log.info("Removing stale STA profile …")[m
+[31m-        _nmcli("connection", "delete", STA_PROFILE_NAME)[m
+[32m+[m[32m    log.info("Bringing AP down to free wlan0 for client scan...")[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        _nmcli("connection", "down", AP_PROFILE_NAME, timeout=10)[m
+[32m+[m[32m    except Exception as exc:[m
+[32m+[m[32m        log.warning("Could not bring AP down (may already be down):%s", exc)[m
+ [m
+[31m-    log.info("Creating STA profile for SSID '%s' …", ssid)[m
+[31m-    r = _nmcli([m
+[31m-        "connection", "add",[m
+[31m-        "type",        "wifi",[m
+[31m-        "ifname",      IFACE,[m
+[31m-        "con-name",    STA_PROFILE_NAME,[m
+[31m-        "autoconnect", "yes",[m
+[31m-        "ssid",        ssid,[m
+[31m-        "--",[m
+[31m-        "wifi-sec.key-mgmt", "wpa-psk",[m
+[31m-        "wifi-sec.psk",      password,[m
+[31m-        "ipv4.method",       "auto",[m
+[31m-        "ipv6.method",       "disabled",[m
+[31m-        timeout=NM_CMD_TIMEOUT,[m
+[31m-    )[m
+[31m-    return r.returncode == 0[m
+[32m+[m[32m    time.sleep(2)[m
+ [m
+[32m+[m[32m    log.info("Rescanning for available networks on %s...", IFACE)[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        _nmcli("device", "wifi", "rescan", "ifname", IFACE, timeout=10)[m
+[32m+[m[32m    except subprocess.TimeoutExpired:[m
+[32m+[m[32m        log.warning("rescan command timed out, continuing anyway")[m
+[32m+[m
+[32m+[m[32m    time.sleep(5)[m
+[32m+[m
+[32m+[m[32m    list_result = _nmcli("--terse", "--fields", "SSID", "device", "wifi", "list", "ifname", IFACE, timeout=10,)[m
+[32m+[m[32m    visible_ssids = {line.strip() for line in list_result.stdout.splitlines() if line.strip()}[m
+[32m+[m[32m    if ssid not in visible_ssids:[m
+[32m+[m[32m        log.error("SSID '%s' not visible after rescan. Available: %s", ssid, sorted(visible_ssids)[:10])[m
+[32m+[m[32m        return False[m
+[32m+[m
+[32m+[m[32m    log.info("SSID '%s' visible. Connecting...", ssid)[m
+[32m+[m[32m    r = subprocess.run([m
+[32m+[m[32m        [[m
+[32m+[m[32m            "nmcli",[m
+[32m+[m[32m            "device", "wifi", "connect", ssid,[m
+[32m+[m[32m            "password", password,[m
+[32m+[m[32m            "ifname", IFACE,[m
+[32m+[m[32m            "name", STA_PROFILE_NAME,[m
+[32m+[m[32m        ],[m
+[32m+[m[32m        capture_output=True,[m
+[32m+[m[32m        text=True,[m
+[32m+[m[32m        timeout=NM_CMD_TIMEOUT,)[m
+[32m+[m
+[32m+[m[32m    if r.returncode != 0:[m
+[32m+[m[32m        log.error("WiFi connect failed: %s", r.stderr.strip())[m
+[32m+[m[32m        return False[m
+[32m+[m
+[32m+[m[32m    log.info("Connected to '%s' successfully.", ssid)[m
+[32m+[m[32m    return True[m
+ [m
+ def _activate_sta_profile() -> bool:[m
+     log.info("Activating STA profile …")[m
+[36m@@ -112,7 +131,7 @@[m [mdef _activate_sta_profile() -> bool:[m
+         pass[m
+ [m
+     r = _nmcli([m
+[31m-        "--timeout", str(CONNECT_TIMEOUT),[m
+[32m+[m[32m        "--wait", str(CONNECT_TIMEOUT),[m
+         "connection", "up", STA_PROFILE_NAME,[m
+         timeout=CONNECT_TIMEOUT + 5,[m
+     )[m
+[1mdiff --git a/process-a/process_A.py b/process-a/process_A.py[m
+[1mindex f94c03d..240b108 100644[m
+[1m--- a/process-a/process_A.py[m
+[1m+++ b/process-a/process_A.py[m
+[36m@@ -54,6 +54,25 @@[m [mimport busio[m
+ import adafruit_ads1x15.ads1115 as ADS[m
+ from adafruit_ads1x15.analog_in import AnalogIn[m
+ [m
+[32m+[m[32mDEVICE_FILE_PATH= os.environ.get("DEVICE_FILE_PATH", "/etc/shelfaware/device.json")[m
+[32m+[m
+[32m+[m[32mdef _load_shelf_id(default: str) -> tuple[str, str]:[m
+[32m+[m[32m    path = Path(DEVICE_FILE_PATH)[m
+[32m+[m[32m    if path.exists():[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            data = json.loads(path.read_text())[m
+[32m+[m[32m            shelf_id = data.get("shelf_id")[m
+[32m+[m[32m            if isinstance(shelf_id, str) and shelf_id:[m
+[32m+[m[32m                return shelf_id, f"device.json ({path})"[m
+[32m+[m[32m        except Exception as exc:[m
+[32m+[m[32m            print(f"WARN: could not parse {path}: {exc}", flush=True)[m
+[32m+[m
+[32m+[m[32m    env_shelf= os.environ-get("SHELF_ID")[m
+[32m+[m[32m    if env_shelf:[m
+[32m+[m[32m        return env_shelf, "SHELF_ID env var"[m
+[32m+[m
+[32m+[m[32m    return default, "hardcoded default"[m
+[32m+[m
+ # ------------------------------------------------------------------------------[m
+ # Logging[m
+ # ------------------------------------------------------------------------------[m
+[36m@@ -405,8 +424,11 @@[m [mclass SensorFaultTracker:[m
+ # ------------------------------------------------------------------------------[m
+ [m
+ def main() -> None:[m
+[32m+[m[32m    shelf_id, source = _load_shelf_id(default=CONFIG.shelf_id)[m
+[32m+[m[32m    CONFIG.shelf_id = shelf_id[m
+[32m+[m
+     log.info("=" * 60)[m
+[31m-    log.info("PROCESS A STARTING  |  SHELF: %s", CONFIG.shelf_id)[m
+[32m+[m[32m    log.info("PROCESS A STARTING  |  SHELF: %s | source: %s", CONFIG.shelf_id, source)[m
+     log.info("Sensor sequence (scale_index order): %s", SENSOR_SEQUENCE)[m
+     log.info([m
+         "Delta-based polling | active=%.1fs  idle=%.1fs  "[m
+[1mdiff --git a/process-b/process_b/main.py b/process-b/process_b/main.py[m
+[1mindex d017fa5..da88704 100644[m
+[1m--- a/process-b/process_b/main.py[m
+[1m+++ b/process-b/process_b/main.py[m
+[36m@@ -62,14 +62,6 @@[m [mdef run() -> NoReturn:[m
+         sys.exit(0)[m
+     sys.exit(0)[m
+ [m
+[31m-[m
+[31m-if __name__ == "__main__":[m
+[31m-    # Allows `python3 main.py` as well as the `process-b` console script.[m
+[31m-    # The orchestrator (orchestration/orchestrator.py) launches Process B[m
+[31m-    # by direct file path, so this block is required for that path.[m
+[31m-    run()[m
+[31m-[m
+[31m-[m
+ async def main(config: Config) -> None:[m
+     """Open resources, run the three worker tasks, clean up on exit."""[m
+     stop_event = asyncio.Event()[m
+[36m@@ -176,3 +168,6 @@[m [mdef _install_signal_handlers(stop_event: asyncio.Event) -> None:[m
+             # also lack add_signal_handler. Fall through silently — Ctrl+C[m
+             # still works via KeyboardInterrupt.[m
+             pass[m
+[32m+[m
+[32m+[m[32mif __name__ == "__main__":[m
+[32m+[m[32m    run()[m

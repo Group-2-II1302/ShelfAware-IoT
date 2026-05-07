@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh  –  ShelfAware deployment script (Refactored)
+# install.sh  –  ShelfAware deployment script
 # =============================================================================
 # Run once on a freshly flashed Raspberry Pi OS Bookworm (headless).
 # Idempotent – safe to re-run.
 #
 # ⚠️  TAILSCALE WARNING: This script calls nmcli and systemctl which will
-#      modify NetworkManager and may sever your remote connection.
-#      Run from a local terminal or physical keyboard/monitor only.
+#     modify NetworkManager and may sever your remote connection.
+#     Run from a local terminal or physical keyboard/monitor only.
 #
 # Usage:
-#    sudo bash install.sh
+#   sudo bash install.sh
 # =============================================================================
 
 set -euo pipefail
@@ -25,39 +25,28 @@ fatal() { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_DIR="/opt/shelfaware"
-VENV_DIR="$INSTALL_DIR/venv"
 SERVICE_FILE="shelfaware-orchestrator.service"
 
 # ── 1. Dependencies ──────────────────────────────────────────────────────────
 info "Installing system dependencies …"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv network-manager iproute2 iputils-ping
+    python3 python3-pip network-manager iproute2 iputils-ping
 
-# ── 2. Create Virtual Environment ─────────────────────────────────────────────
-info "Setting up Python virtual environment at $VENV_DIR …"
-mkdir -p "$INSTALL_DIR"
-if [[ ! -d "$VENV_DIR" ]]; then
-    python3 -m venv "$VENV_DIR"
-fi
-
-# Define our localized pip and python runtimes
-VENV_PIP="$VENV_DIR/bin/pip"
-VENV_PYTHON="$VENV_DIR/bin/python3"
-
-# Upgrade pip inside the virtual environment
-info "Upgrading virtual environment pip …"
-"$VENV_PIP" install --upgrade --quiet pip
-
-# ── 3. Install Python deps ────────────────────────────────────────────────────
-info "Installing core system Python packages in venv …"
+# ── 2. Install Python deps ────────────────────────────────────────────────────
+info "Installing Python packages …"
 
 # Process A: hardware drivers
-"$VENV_PIP" install --quiet \
+pip3 install --break-system-packages --quiet \
     adafruit-blinka \
     adafruit-circuitpython-ads1x15
 
-# ── 4. Deploy application files ───────────────────────────────────────────────
+# Process B's runtime deps are installed in section 3 below, AFTER its
+# source has been staged to $INSTALL_DIR. Installing here would either
+# pin to the repo working tree (wrong: /opt is the source of truth in
+# production) or fail (no pyproject.toml in $INSTALL_DIR yet).
+
+# ── 3. Deploy application files ───────────────────────────────────────────────
 info "Deploying application to $INSTALL_DIR …"
 mkdir -p "$INSTALL_DIR/orchestration"
 mkdir -p "$INSTALL_DIR/process-a"
@@ -83,10 +72,12 @@ if [[ -f "$REPO_ROOT/process-b/README.md" ]]; then
     cp "$REPO_ROOT/process-b/README.md" "$INSTALL_DIR/process-b/"
 fi
 
-info "Installing Process B's Python dependencies into venv …"
-"$VENV_PIP" install --quiet -e "$INSTALL_DIR/process-b"
+info "Installing Process B's Python dependencies …"
+pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-b"
 
 # Process C: stage source AND pyproject so we can pip install from $INSTALL_DIR.
+# The orchestrator launches it via /opt/shelfaware/process-c/process_c.py
+# (a small shim that forwards to process_c.main:run on the installed package).
 if [[ -d "$REPO_ROOT/process-c/process_c" ]]; then
     cp -r "$REPO_ROOT/process-c/process_c/." "$INSTALL_DIR/process-c/process_c/"
     cp    "$REPO_ROOT/process-c/pyproject.toml" "$INSTALL_DIR/process-c/"
@@ -96,8 +87,8 @@ if [[ -d "$REPO_ROOT/process-c/process_c" ]]; then
     cp "$REPO_ROOT/process-c/process_c.py" "$INSTALL_DIR/process-c/process_c.py"
     chmod 755 "$INSTALL_DIR/process-c/process_c.py"
 
-    info "Installing Process C's Python dependencies into venv …"
-    "$VENV_PIP" install --quiet -e "$INSTALL_DIR/process-c"
+    info "Installing Process C's Python dependencies …"
+    pip3 install --break-system-packages --quiet -e "$INSTALL_DIR/process-c"
 else
     warn "process-c package not found – creating placeholder stub."
     cat > "$INSTALL_DIR/process-c/process_c.py" <<STUB
@@ -112,14 +103,18 @@ STUB
     chmod 755 "$INSTALL_DIR/process-c/process_c.py"
 fi
 
-# ── 5. State and log directories ──────────────────────────────────────────────
+# ── 4. State and log directories ──────────────────────────────────────────────
 mkdir -p /var/lib/shelfaware
 chmod 750 /var/lib/shelfaware
 
 touch /var/log/shelfaware_orchestrator.log
 chmod 640 /var/log/shelfaware_orchestrator.log
 
-# ── 5b. Process B environment file ────────────────────────────────────────────
+# ── 4b. Process B environment file ────────────────────────────────────────────
+# Process B reads PI_API_KEY, BACKEND_URL, SHELF_IDS, DB_PATH, etc. from env.
+# The systemd unit loads them from /etc/shelfaware/process-b.env.
+# If the file doesn't already exist, drop a template that the operator must
+# fill in BEFORE the orchestrator first launches Process B.
 mkdir -p /etc/shelfaware
 chmod 750 /etc/shelfaware
 
@@ -148,7 +143,7 @@ else
     info "Process B env file already exists at $PROCESS_B_ENV – leaving untouched."
 fi
 
-# ── 6. NetworkManager – ensure it's running ───────────────────────────────────
+# ── 5. NetworkManager – ensure it's running ───────────────────────────────────
 info "Enabling NetworkManager …"
 systemctl enable NetworkManager
 systemctl start  NetworkManager
@@ -158,18 +153,13 @@ for i in {1..10}; do
     warn "Waiting for nmcli ($i/10) …"; sleep 2
 done
 
-# ── 7. Pre-configure the AP hotspot profile ───────────────────────────────────
+# ── 6. Pre-configure the AP hotspot profile ───────────────────────────────────
 info "Configuring AP hotspot profile …"
-# Explicitly use the venv python interpreter when executing setup dependencies if any
 bash "$INSTALL_DIR/orchestration/shelfaware_network_setup.sh"
 
-# ── 8. Install and enable the systemd service ─────────────────────────────────
+# ── 7. Install and enable the systemd service ─────────────────────────────────
 info "Installing systemd service …"
 cp "$SCRIPT_DIR/$SERVICE_FILE" /etc/systemd/system/
-
-# Update the service file to use our local venv Python executable instead of global python3
-sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|g" "/etc/systemd/system/$SERVICE_FILE"
-
 systemctl daemon-reload
 systemctl enable "$SERVICE_FILE"
 
