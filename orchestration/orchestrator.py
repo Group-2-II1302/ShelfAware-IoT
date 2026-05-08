@@ -61,8 +61,8 @@ PROCESS_B_PATTERN = "process-b/process_b/main.py"
 PROCESS_C_PATTERN = "process-c/process_c.py"
 
 PING_HOST        = "8.8.8.8"
-PING_TIMEOUT_SEC = 10
-PING_COUNT       = 3
+PING_TIMEOUT_SEC = 5
+PING_COUNT       = 2
 
 NM_READY_TIMEOUT = 30
 NM_POLL_INTERVAL = 2
@@ -487,7 +487,7 @@ def main() -> None:
         sys.exit(1)
 
     log.info("Orchestrator entering steady-state monitor loop.")
-    check_interval = 60
+    check_interval = 30
 
     while True:
         time.sleep(check_interval)
