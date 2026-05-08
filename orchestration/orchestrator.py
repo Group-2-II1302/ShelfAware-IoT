@@ -74,6 +74,15 @@ PROC_TERM_GRACE  = 5
 MAX_FAILURES     = 5
 
 # ──────────────────────────────────────────────
+# WiFi-only recovery tuning
+# ──────────────────────────────────────────────
+STA_PROFILE_NAME            = "ShelfAware_STA"
+RECOVERY_PROBE_INTERVAL_SEC = 30   # 30 seconds between STA probes while in offline mode
+RECOVERY_REBOOT_AFTER_SEC   = 600  # 10 min stuck offline → reboot fallback
+RECOVERY_STA_PROBE_TIMEOUT  = 30    # how long to wait for STA association
+RECOVERY_PING_AFTER_STA_SEC = 10    # let DHCP/DNS settle before pinging
+
+# ──────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────
 
@@ -375,6 +384,61 @@ def switch_to_ap_mode() -> bool:
         log.error("Unexpected AP switch error: %s", exc, exc_info=True)
     return False
 
+def _restore_ap_after_probe() -> None:
+    """Bring AP back up after a failed STA probe."""
+    if DEV_MODE:
+        return
+    try:
+        _nmcli("device", "disconnect", "wlan0", timeout=10)
+    except Exception:
+        pass
+    try:
+        _nmcli("connection", "up", AP_PROFILE_NAME, timeout=20)
+        log.info("AP restored after probe.")
+    except Exception as exc:
+        log.warning("Could not restore AP after probe: %s", exc)
+
+
+def try_sta_recovery() -> bool:
+    """Bring AP down, try to reconnect to saved STA, verify internet.
+
+    Returns True if recovery succeeded (Pi has internet via WiFi).
+    Returns False if STA association or ping failed; AP is restored on failure.
+    """
+    if DEV_MODE:
+        log.info("[DEV MODE] Skipping STA recovery probe — returning True.")
+        return True
+
+    log.info("STA recovery probe started.")
+
+    # Free wlan0 from AP duty so it can scan + associate as a client.
+    try:
+        _nmcli("connection", "down", AP_PROFILE_NAME, timeout=10)
+    except Exception:
+        pass  # AP might not have been up; either way, fine
+
+    time.sleep(2)
+
+    # Try to bring up the saved STA profile (created by wifi_connector.py).
+    try:
+        _nmcli("connection", "up", STA_PROFILE_NAME,
+               timeout=RECOVERY_STA_PROBE_TIMEOUT)
+        log.info("STA profile '%s' associated.", STA_PROFILE_NAME)
+    except Exception as exc:
+        log.info("STA association failed during probe: %s", exc)
+        _restore_ap_after_probe()
+        return False
+
+    # Let DHCP and DNS settle, then verify actual internet.
+    time.sleep(RECOVERY_PING_AFTER_STA_SEC)
+
+    if has_internet():
+        log.info("STA recovery succeeded — internet reachable.")
+        return True
+
+    log.info("STA up but ping failed — restoring AP.")
+    _restore_ap_after_probe()
+    return False
 
 # ──────────────────────────────────────────────
 # Main orchestration logic
@@ -392,7 +456,7 @@ def run_online_mode() -> None:
             pass
         except Exception as exc:
             log.warning("Could not bring AP down: %s", exc)
-        
+
         try:
             _nmcli("connection", "up", "ShelfAware_STA", timeout=20)
             log.info("STA profile reconnected.")
@@ -487,29 +551,65 @@ def main() -> None:
         sys.exit(1)
 
     log.info("Orchestrator entering steady-state monitor loop.")
-    check_interval = 30
+    check_interval = 10
+    last_recovery_probe = time.monotonic()
+    offline_since: Optional[float] = (
+        time.monotonic() if state["last_mode"] == "offline" else None
+    )
 
     while True:
         time.sleep(check_interval)
+        now = time.monotonic()
 
-        try:
-            still_online = has_internet()
-        except Exception as exc:
-            log.warning("Periodic internet check failed: %s", exc)
-            continue
+        if state["last_mode"] == "offline":
+            # has_internet() is useless during AP mode (no client route).
+            # Probe by actually trying to reconnect STA every N seconds.
+            stuck_for = now - (offline_since or now)
 
-        if still_online and state["last_mode"] != "online":
-            log.info("Network recovered – switching to online mode.")
-            run_online_mode()
-            state["last_mode"] = "online"
-            _save_state(state)
+            # Reboot fallback: if we've been stuck offline too long, give up
+            # and let systemd start us fresh. On a clean boot, has_internet()
+            # works again because nothing has put wlan0 in AP mode yet.
+            if stuck_for >= RECOVERY_REBOOT_AFTER_SEC:
+                log.warning(
+                    "Offline for %.0f min with no recovery — rebooting.",
+                    stuck_for / 60,
+                )
+                try:
+                    subprocess.run(["systemctl", "reboot"], timeout=10)
+                except Exception as exc:
+                    log.error("Reboot command failed: %s", exc)
+                continue
 
-        elif not still_online and state["last_mode"] != "offline":
-            log.warning("Network lost – switching to offline/setup mode.")
-            run_offline_mode()
-            state["last_mode"] = "offline"
-            _save_state(state)
+            if (now - last_recovery_probe) >= RECOVERY_PROBE_INTERVAL_SEC:
+                last_recovery_probe = now
+                if try_sta_recovery():
+                    log.info("STA recovery succeeded — switching to online mode.")
+                    run_online_mode()
+                    state["last_mode"] = "online"
+                    state["consecutive_failures"] = 0
+                    _save_state(state)
+                    offline_since = None
 
+        else:  # currently online
+            try:
+                still_online = has_internet()
+            except Exception as exc:
+                log.warning("Periodic internet check failed: %s", exc)
+                continue
+
+            if not still_online:
+                log.warning("Network lost – switching to offline/setup mode.")
+                try:
+                    run_offline_mode()
+                except Exception as exc:
+                    log.critical("Offline-mode transition failed: %s", exc)
+                    continue
+                state["last_mode"] = "offline"
+                _save_state(state)
+                offline_since = time.monotonic()
+                last_recovery_probe = time.monotonic()
+
+        # Watchdog — detect dead children.
         for name, proc in _running.items():
             if proc is not None:
                 rc = proc.poll()
@@ -517,7 +617,6 @@ def main() -> None:
                     log.warning("Process %s (PID %d) exited unexpectedly "
                                 "with code %d.", name, proc.pid, rc)
                     _running[name] = None
-
 
 if __name__ == "__main__":
     try:
