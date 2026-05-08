@@ -384,6 +384,21 @@ def run_online_mode() -> None:
     log.info("=== ONLINE MODE ===")
     _kill_group("C")
 
+    if not DEV_MODE:
+        try:
+            _nmcli("connection", "down", AP_PROFILE_NAME, timeout=10)
+            log.info("AP profile brought down.")
+        except subprocess.CalledProcessError:
+            pass
+        except Exception as exc:
+            log.warning("Could not bring AP down: %s", exc)
+        
+        try:
+            _nmcli("connection", "up", "ShelfAware_STA", timeout=20)
+            log.info("STA profile reconnected.")
+        except Exception as exc:
+            log.warning("Could not reconnect STA: %s", exc)
+
     if _running["A"] and _running["A"].poll() is None:
         log.info("Process A already running (PID %d).", _running["A"].pid)
     else:
