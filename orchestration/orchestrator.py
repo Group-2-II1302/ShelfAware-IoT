@@ -56,9 +56,13 @@ else:
     PROCESS_B_CMD = [sys.executable, "/opt/shelfaware/process-b/process_b/main.py"]
     PROCESS_C_CMD = [sys.executable, "/opt/shelfaware/process-c/process_c.py"]
 
+PROCESS_A_PATTERN = "process-a/process_A.py"
+PROCESS_B_PATTERN = "process-b/process_b/main.py"
+PROCESS_C_PATTERN = "process-c/process_c.py"
+
 PING_HOST        = "8.8.8.8"
-PING_TIMEOUT_SEC = 10
-PING_COUNT       = 3
+PING_TIMEOUT_SEC = 5
+PING_COUNT       = 2
 
 NM_READY_TIMEOUT = 30
 NM_POLL_INTERVAL = 2
@@ -68,6 +72,15 @@ CONNECT_TIMEOUT  = 30
 
 PROC_TERM_GRACE  = 5
 MAX_FAILURES     = 5
+
+# ──────────────────────────────────────────────
+# WiFi-only recovery tuning
+# ──────────────────────────────────────────────
+STA_PROFILE_NAME            = "ShelfAware_STA"
+RECOVERY_PROBE_INTERVAL_SEC = 30   # 30 seconds between STA probes while in offline mode
+RECOVERY_REBOOT_AFTER_SEC   = 600  # 10 min stuck offline → reboot fallback
+RECOVERY_STA_PROBE_TIMEOUT  = 30    # how long to wait for STA association
+RECOVERY_PING_AFTER_STA_SEC = 10    # let DHCP/DNS settle before pinging
 
 # ──────────────────────────────────────────────
 # Logging
@@ -248,9 +261,11 @@ def _kill_group(*names: str) -> None:
 def _launch_process(name: str, cmd: list[str]) -> Optional[subprocess.Popen]:
     log.info("Launching Process %s: %s", name, " ".join(cmd))
     try:
+        log_path = f"/var/log/shelfaware_proc_{name.lower()}.log"
+        log_fh = open(log_path, "ab", buffering=0)
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=log_fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -267,10 +282,71 @@ def _launch_process(name: str, cmd: list[str]) -> Optional[subprocess.Popen]:
     _running[name] = None
     return None
 
+def _kill_orphans() -> None:
+    """Kill any leftover process_a/b/c instances from previous orchestrator runs.
+
+    Called at startup before any launches. Without this, an unclean shutdown
+    of a previous orchestrator session can leave Process A/B/C running outside
+    our cgroup, causing port conflicts and double-instances when we relaunch.
+    """
+    if DEV_MODE:
+        log.info("[DEV MODE] skipping orphan cleanup")
+        return
+
+    patterns = [
+        "process-b/process_b/main.py",
+        "process-a/process_A.py",
+        "process-c/process_c.py",
+    ]
+    for pat in patterns:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", pat],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split()
+                log.warning("Found orphaned %s (pids=%s); killing.", pat, pids)
+                subprocess.run(["pkill", "-9", "-f", pat], timeout=5)
+        except Exception as exc:
+            log.warning("Orphan check for %s failed: %s", pat, exc)
+
+    time.sleep(2)
 
 # ──────────────────────────────────────────────
 # NetworkManager / AP helpers
 # ──────────────────────────────────────────────
+
+def _kill_by_pattern(pattern: str) -> None:
+    """Kill any process whose cmdline matches ``pattern``. No-op if none.
+
+    Used as defence-in-depth before launching A/B/C. If a previous orchestrator
+    session left an orphan that we haven't tracked in ``_running``, this
+    ensures we don't race against it for a port (e.g. UDP 5005 for B).
+    """
+    if DEV_MODE:
+        return
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split()
+            log.warning(
+                "Killing stale process matching %r (pids=%s) before relaunch.",
+                pattern, pids,
+            )
+            subprocess.run(["pkill", "-9", "-f", pattern], timeout=5)
+            time.sleep(1)
+    except Exception as exc:
+        log.warning("Stale-process kill for %r failed: %s", pattern, exc)
+
+
+def _safe_launch(name: str, cmd: list[str], pattern: str) -> Optional[subprocess.Popen]:
+    """Kill any orphan matching ``pattern`` then launch. See :func:`_kill_by_pattern`."""
+    _kill_by_pattern(pattern)
+    return _launch_process(name, cmd)
 
 def _nmcli(*args: str, timeout: int = 15) -> subprocess.CompletedProcess:
     cmd = ["nmcli"] + list(args)
@@ -308,6 +384,61 @@ def switch_to_ap_mode() -> bool:
         log.error("Unexpected AP switch error: %s", exc, exc_info=True)
     return False
 
+def _restore_ap_after_probe() -> None:
+    """Bring AP back up after a failed STA probe."""
+    if DEV_MODE:
+        return
+    try:
+        _nmcli("device", "disconnect", "wlan0", timeout=10)
+    except Exception:
+        pass
+    try:
+        _nmcli("connection", "up", AP_PROFILE_NAME, timeout=20)
+        log.info("AP restored after probe.")
+    except Exception as exc:
+        log.warning("Could not restore AP after probe: %s", exc)
+
+
+def try_sta_recovery() -> bool:
+    """Bring AP down, try to reconnect to saved STA, verify internet.
+
+    Returns True if recovery succeeded (Pi has internet via WiFi).
+    Returns False if STA association or ping failed; AP is restored on failure.
+    """
+    if DEV_MODE:
+        log.info("[DEV MODE] Skipping STA recovery probe — returning True.")
+        return True
+
+    log.info("STA recovery probe started.")
+
+    # Free wlan0 from AP duty so it can scan + associate as a client.
+    try:
+        _nmcli("connection", "down", AP_PROFILE_NAME, timeout=10)
+    except Exception:
+        pass  # AP might not have been up; either way, fine
+
+    time.sleep(2)
+
+    # Try to bring up the saved STA profile (created by wifi_connector.py).
+    try:
+        _nmcli("connection", "up", STA_PROFILE_NAME,
+               timeout=RECOVERY_STA_PROBE_TIMEOUT)
+        log.info("STA profile '%s' associated.", STA_PROFILE_NAME)
+    except Exception as exc:
+        log.info("STA association failed during probe: %s", exc)
+        _restore_ap_after_probe()
+        return False
+
+    # Let DHCP and DNS settle, then verify actual internet.
+    time.sleep(RECOVERY_PING_AFTER_STA_SEC)
+
+    if has_internet():
+        log.info("STA recovery succeeded — internet reachable.")
+        return True
+
+    log.info("STA up but ping failed — restoring AP.")
+    _restore_ap_after_probe()
+    return False
 
 # ──────────────────────────────────────────────
 # Main orchestration logic
@@ -315,15 +446,37 @@ def switch_to_ap_mode() -> bool:
 
 def run_online_mode() -> None:
     log.info("=== ONLINE MODE ===")
-    _kill_group("B", "C")
+    _kill_group("C")
+
+    if not DEV_MODE:
+        try:
+            _nmcli("connection", "down", AP_PROFILE_NAME, timeout=10)
+            log.info("AP profile brought down.")
+        except subprocess.CalledProcessError:
+            pass
+        except Exception as exc:
+            log.warning("Could not bring AP down: %s", exc)
+
+        try:
+            _nmcli("connection", "up", "ShelfAware_STA", timeout=20)
+            log.info("STA profile reconnected.")
+        except Exception as exc:
+            log.warning("Could not reconnect STA: %s", exc)
 
     if _running["A"] and _running["A"].poll() is None:
-        log.info("Process A already running (PID %d) – no action needed.",
-                 _running["A"].pid)
-        return
+        log.info("Process A already running (PID %d).", _running["A"].pid)
+    else:
+        _safe_launch("A", PROCESS_A_CMD, PROCESS_A_PATTERN)
 
-    _launch_process("A", PROCESS_A_CMD)
+    # Always restart B on entry to online mode so the registrar gets a
+    # fresh attempt with the (now-reachable) backend. The registrar runs
+    # once at B startup; if it gave up during the offline phase (or is
+    # mid-backoff), the only reliable way to retrigger is a clean restart.
 
+    if _running["B"] and _running["B"].poll() is None:
+        log.info("Restarting Process B (PID %d) to refresh registrar.", _running["B"].pid)
+        _kill_process("B")
+    _safe_launch("B", PROCESS_B_CMD, PROCESS_B_PATTERN)
 
 def run_offline_mode() -> None:
     log.info("=== OFFLINE / SETUP MODE ===")
@@ -336,11 +489,11 @@ def run_offline_mode() -> None:
     time.sleep(3)
 
     if not (_running["C"] and _running["C"].poll() is None):
-        _launch_process("C", PROCESS_C_CMD)
+        _safe_launch("C", PROCESS_C_CMD, PROCESS_C_PATTERN)
         time.sleep(2)
 
     if not (_running["B"] and _running["B"].poll() is None):
-        _launch_process("B", PROCESS_B_CMD)
+        _safe_launch("B", PROCESS_B_CMD, PROCESS_B_PATTERN)
 
 
 def main() -> None:
@@ -352,6 +505,8 @@ def main() -> None:
             "[DEV MODE] SHELFAWARE_DEV=1 — all nmcli/NM calls are "
             "short-circuited. Safe for Tailscale / hotspot development."
         )
+
+    _kill_orphans()
 
     state = _load_state()
 
@@ -396,29 +551,65 @@ def main() -> None:
         sys.exit(1)
 
     log.info("Orchestrator entering steady-state monitor loop.")
-    check_interval = 60
+    check_interval = 10
+    last_recovery_probe = time.monotonic()
+    offline_since: Optional[float] = (
+        time.monotonic() if state["last_mode"] == "offline" else None
+    )
 
     while True:
         time.sleep(check_interval)
+        now = time.monotonic()
 
-        try:
-            still_online = has_internet()
-        except Exception as exc:
-            log.warning("Periodic internet check failed: %s", exc)
-            continue
+        if state["last_mode"] == "offline":
+            # has_internet() is useless during AP mode (no client route).
+            # Probe by actually trying to reconnect STA every N seconds.
+            stuck_for = now - (offline_since or now)
 
-        if still_online and state["last_mode"] != "online":
-            log.info("Network recovered – switching to online mode.")
-            run_online_mode()
-            state["last_mode"] = "online"
-            _save_state(state)
+            # Reboot fallback: if we've been stuck offline too long, give up
+            # and let systemd start us fresh. On a clean boot, has_internet()
+            # works again because nothing has put wlan0 in AP mode yet.
+            if stuck_for >= RECOVERY_REBOOT_AFTER_SEC:
+                log.warning(
+                    "Offline for %.0f min with no recovery — rebooting.",
+                    stuck_for / 60,
+                )
+                try:
+                    subprocess.run(["systemctl", "reboot"], timeout=10)
+                except Exception as exc:
+                    log.error("Reboot command failed: %s", exc)
+                continue
 
-        elif not still_online and state["last_mode"] != "offline":
-            log.warning("Network lost – switching to offline/setup mode.")
-            run_offline_mode()
-            state["last_mode"] = "offline"
-            _save_state(state)
+            if (now - last_recovery_probe) >= RECOVERY_PROBE_INTERVAL_SEC:
+                last_recovery_probe = now
+                if try_sta_recovery():
+                    log.info("STA recovery succeeded — switching to online mode.")
+                    run_online_mode()
+                    state["last_mode"] = "online"
+                    state["consecutive_failures"] = 0
+                    _save_state(state)
+                    offline_since = None
 
+        else:  # currently online
+            try:
+                still_online = has_internet()
+            except Exception as exc:
+                log.warning("Periodic internet check failed: %s", exc)
+                continue
+
+            if not still_online:
+                log.warning("Network lost – switching to offline/setup mode.")
+                try:
+                    run_offline_mode()
+                except Exception as exc:
+                    log.critical("Offline-mode transition failed: %s", exc)
+                    continue
+                state["last_mode"] = "offline"
+                _save_state(state)
+                offline_since = time.monotonic()
+                last_recovery_probe = time.monotonic()
+
+        # Watchdog — detect dead children.
         for name, proc in _running.items():
             if proc is not None:
                 rc = proc.poll()
@@ -426,7 +617,6 @@ def main() -> None:
                     log.warning("Process %s (PID %d) exited unexpectedly "
                                 "with code %d.", name, proc.pid, rc)
                     _running[name] = None
-
 
 if __name__ == "__main__":
     try:

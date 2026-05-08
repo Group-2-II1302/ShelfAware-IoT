@@ -1,0 +1,19 @@
+○ shelfaware-orchestrator.service - ShelfAware Boot Orchestrator
+     Loaded: loaded (]8;;file://lightbox/etc/systemd/system/shelfaware-orchestrator.service\/etc/systemd/system/shelfaware-orchestrator.service]8;;\; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: inactive (dead) since Tue 2026-05-05 19:14:00 CEST; 4min 36s ago
+   Duration: 6min 54.065s
+ Invocation: ac64947c21d240e898ad2048177f6f91
+       Docs: ]8;;file:///opt/shelfaware/README.md\file:///opt/shelfaware/README.md]8;;\
+   Main PID: 7654 (code=killed, signal=TERM)
+        CPU: 2.171s
+
+May 05 19:11:15 lightbox shelfaware-orchestrator[7654]: 2026-05-05T19:11:15  INFO      has_internet                    Internet check → OFFLINE
+May 05 19:12:15 lightbox shelfaware-orchestrator[7654]: 2026-05-05T19:12:15  INFO      has_internet                    Checking internet: ping -c 3 -W 10 8.8.8.8
+May 05 19:12:15 lightbox shelfaware-orchestrator[7654]: 2026-05-05T19:12:15  INFO      has_internet                    Internet check → OFFLINE
+May 05 19:13:15 lightbox shelfaware-orchestrator[7654]: 2026-05-05T19:13:15  INFO      has_internet                    Checking internet: ping -c 3 -W 10 8.8.8.8
+May 05 19:13:15 lightbox shelfaware-orchestrator[7654]: 2026-05-05T19:13:15  INFO      has_internet                    Internet check → OFFLINE
+May 05 19:14:00 lightbox systemd[1]: Stopping shelfaware-orchestrator.service - ShelfAware Boot Orchestrator...
+May 05 19:14:00 lightbox systemd[1]: shelfaware-orchestrator.service: Deactivated successfully.
+May 05 19:14:00 lightbox systemd[1]: Stopped shelfaware-orchestrator.service - ShelfAware Boot Orchestrator.
+May 05 19:14:00 lightbox systemd[1]: shelfaware-orchestrator.service: Consumed 2.171s CPU time.
+May 05 19:16:52 lightbox systemd[1]: [0;1;38:5:185m[0;1;39m[0;1;38:5:185m]8;;file://lightbox/etc/systemd/system/shelfaware-orchestrator.service\/etc/systemd/system/shelfaware-orchestrator.service]8;;\:67: Unknown key 'StartLimitIntervalSec' in section [Service], ignoring.[0m
