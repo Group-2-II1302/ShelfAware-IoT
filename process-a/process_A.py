@@ -67,7 +67,7 @@ def _load_shelf_id(default: str) -> tuple[str, str]:
         except Exception as exc:
             print(f"WARN: could not parse {path}: {exc}", flush=True)
 
-    env_shelf= os.environ-get("SHELF_ID")
+    env_shelf= os.environ.get("SHELF_ID")
     if env_shelf:
         return env_shelf, "SHELF_ID env var"
 
