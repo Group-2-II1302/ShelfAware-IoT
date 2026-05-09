@@ -131,28 +131,8 @@ class SystemConfig:
     # CPU Governor
     governor_active:     str   = "performance"
     governor_idle:       str   = "ondemand"
-    # battery telemetry
-    battery_adc_address:    int   = 0x48
-    battery_adc_channel:    int   = 3
-    battery_divider_ratio:  int   = 2.0 # TBD
-    battery_window_size:    int   = 5
-    #Different polling intervals from scale loop
-    battery_interval_active: float = 10.0
-    battery_interval_idle:   float = 30.0
-
 
 CONFIG = SystemConfig()
-
-# ------------------------------------------------------------------------------
-# Battery telemetry
-# ------------------------------------------------------------------------------
-
-BATTERY_STATE_TABLE = [ # Should be tested
-    ("full",     5.05, 4.95),
-    ("normal",   4.95, 4.85),
-    ("low",      4.80, 4.70),
-    ("critical", 4.70, 0.00),
-]
 
 # ------------------------------------------------------------------------------
 # Sensor map  (insertion order is the scale_index contract)
@@ -405,21 +385,6 @@ def adc_to_grams(adc: float, cfg: SensorConfig) -> float:
         return 0.0
     return (adc / cfg.a_const) ** (1.0 / cfg.b_const)
 
-def determine_battery_state(voltage: float, prev_state: str) -> str:
-    """
-    Hysteretic battery state machine.
-
-    Prevents rapid state flapping near thresholds.
-    """
-    for state, enter_v, exit_v in BATTERY_STATE_TABLE:
-        if prev_state == state:
-            if voltage >= exit_v:
-                return state
-        else:
-            if voltage >= enter_v:
-                return state
-
-    return "critical"
 
 # ------------------------------------------------------------------------------
 # Per-sensor fault tracker
@@ -495,37 +460,6 @@ def main() -> None:
 
     log.info("Initialisation complete. Entering read loop.")
 
-# ------------------------------------------------------------------------------
-# Battery monitor initialisation
-# ------------------------------------------------------------------------------
-
-    battery_channel = HardwareManager.get_adc_channel(
-        CONFIG.battery_adc_address,
-        CONFIG.battery_adc_channel,
-    )
-
-    battery_filter = MovingAverage(CONFIG.battery_window_size)
-
-    battery_prev_voltage: Optional[float] = None
-    battery_state = "full"
-
-    last_battery_sample = 0.0
-
-    if battery_channel is None:
-        log.warning(
-            "Battery ADC channel unavailable "
-            "(0x%02X ch%d). Battery telemetry disabled.",
-            CONFIG.battery_adc_address,
-            CONFIG.battery_adc_channel,
-        )
-    else:
-        log.info(
-            "Battery telemetry enabled at "
-            "0x%02X ch%d",
-            CONFIG.battery_adc_address,
-            CONFIG.battery_adc_channel,
-        )
-
     # Delta-Based Activity State
     previous_grams:   Dict[str, float] = {s: 0.0 for s in SENSOR_SEQUENCE}
     last_activity_ts: float            = 0.0
@@ -600,117 +534,6 @@ def main() -> None:
                     "sensor_id":   s_id,
                 }
                 sock.sendto(json.dumps(payload).encode(), (CONFIG.udp_ip, CONFIG.udp_port))
-
-# ------------------------------------------------------------------------------
-# Battery telemetry
-# ------------------------------------------------------------------------------
-
-            now = time.time()
-
-            battery_interval = (
-                CONFIG.battery_interval_active
-                if is_active
-                else CONFIG.battery_interval_idle
-            )
-
-            should_sample_battery = (
-                battery_channel is not None and
-                (now - last_battery_sample) >= battery_interval
-            )
-
-            if should_sample_battery:
-                try:
-                    raw_voltage = battery_channel.voltage
-
-                    measured_voltage = (
-                        raw_voltage * CONFIG.battery_divider_ratio
-                    )
-
-                    smoothed_voltage = battery_filter.add(measured_voltage)
-
-                    trend = None
-                    if battery_prev_voltage is not None:
-                        trend = (
-                            smoothed_voltage -
-                            battery_prev_voltage
-                        )
-
-                    battery_prev_voltage = smoothed_voltage
-
-                    battery_state = determine_battery_state(
-                        smoothed_voltage,
-                        battery_state,
-                    )
-
-                    battery_payload = {
-                        "metric_type": "battery",
-                        "shelf_id": CONFIG.shelf_id,
-                        "sampled_at": timestamp,
-
-                        "voltage": round(smoothed_voltage, 3),
-
-                        "state": battery_state,
-
-                        "trend": (
-                            round(trend, 5)
-                            if trend is not None
-                            else None
-                        ),
-
-                        "adc_fault": False,
-                    }
-
-                    sock.sendto(
-                        json.dumps(battery_payload).encode(),
-                        (CONFIG.udp_ip, CONFIG.udp_port),
-                    )
-
-                    log.debug(
-                        "[BATTERY] "
-                        "V=%.3f  "
-                        "state=%s  "
-                        "trend=%s",
-                        smoothed_voltage,
-                        battery_state,
-                        (
-                            f"{trend:+.5f}"
-                            if trend is not None
-                            else "None"
-                        ),
-                    )
-
-                    # Optional early warning
-                    if battery_state == "critical":
-                        log.warning(
-                            "[BATTERY] CRITICAL BATTERY LEVEL "
-                            "(%.3fV)",
-                            smoothed_voltage,
-                        )
-
-                    last_battery_sample = now
-
-                except Exception as exc:
-                    log.warning(
-                        "Battery telemetry read failed: %s",
-                        exc,
-                    )
-
-                    battery_payload = {
-                        "metric_type": "battery",
-                        "shelf_id": CONFIG.shelf_id,
-                        "sampled_at": timestamp,
-
-                        "voltage": None,
-                        "state": "fault",
-                        "trend": None,
-
-                        "adc_fault": True,
-                    }
-
-                    sock.sendto(
-                        json.dumps(battery_payload).encode(),
-                        (CONFIG.udp_ip, CONFIG.udp_port),
-                    )
 
         # Re-evaluate after full sweep — a delta mid-loop takes effect now
         is_active      = (time.time() - last_activity_ts) < CONFIG.active_cooldown_s
