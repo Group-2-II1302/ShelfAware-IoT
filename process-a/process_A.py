@@ -54,6 +54,25 @@ import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 
+DEVICE_FILE_PATH= os.environ.get("DEVICE_FILE_PATH", "/etc/shelfaware/device.json")
+
+def _load_shelf_id(default: str) -> tuple[str, str]:
+    path = Path(DEVICE_FILE_PATH)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            shelf_id = data.get("shelf_id")
+            if isinstance(shelf_id, str) and shelf_id:
+                return shelf_id, f"device.json ({path})"
+        except Exception as exc:
+            print(f"WARN: could not parse {path}: {exc}", flush=True)
+
+    env_shelf= os.environ.get("SHELF_ID")
+    if env_shelf:
+        return env_shelf, "SHELF_ID env var"
+
+    return default, "hardcoded default"
+
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
@@ -458,8 +477,11 @@ class SensorFaultTracker:
 # ------------------------------------------------------------------------------
 
 def main() -> None:
+    shelf_id, source = _load_shelf_id(default=CONFIG.shelf_id)
+    CONFIG.shelf_id = shelf_id
+
     log.info("=" * 60)
-    log.info("PROCESS A STARTING  |  SHELF: %s", CONFIG.shelf_id)
+    log.info("PROCESS A STARTING  |  SHELF: %s | source: %s", CONFIG.shelf_id, source)
     log.info("Sensor sequence (scale_index order): %s", SENSOR_SEQUENCE)
     log.info(
         "Delta-based polling | active=%.1fs  idle=%.1fs  "

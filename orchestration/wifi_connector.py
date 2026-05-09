@@ -80,29 +80,48 @@ def _is_connected_to_sta() -> bool:
                 return True
     return False
 
-
 def _create_or_update_sta_profile(ssid: str, password: str) -> bool:
-    if _connection_exists(STA_PROFILE_NAME):
-        log.info("Removing stale STA profile …")
-        _nmcli("connection", "delete", STA_PROFILE_NAME)
+    log.info("Bringing AP down to free wlan0 for client scan...")
+    try:
+        _nmcli("connection", "down", AP_PROFILE_NAME, timeout=10)
+    except Exception as exc:
+        log.warning("Could not bring AP down (may already be down):%s", exc)
 
-    log.info("Creating STA profile for SSID '%s' …", ssid)
-    r = _nmcli(
-        "connection", "add",
-        "type",        "wifi",
-        "ifname",      IFACE,
-        "con-name",    STA_PROFILE_NAME,
-        "autoconnect", "yes",
-        "ssid",        ssid,
-        "--",
-        "wifi-sec.key-mgmt", "wpa-psk",
-        "wifi-sec.psk",      password,
-        "ipv4.method",       "auto",
-        "ipv6.method",       "disabled",
-        timeout=NM_CMD_TIMEOUT,
-    )
-    return r.returncode == 0
+    time.sleep(2)
 
+    log.info("Rescanning for available networks on %s...", IFACE)
+    try:
+        _nmcli("device", "wifi", "rescan", "ifname", IFACE, timeout=10)
+    except subprocess.TimeoutExpired:
+        log.warning("rescan command timed out, continuing anyway")
+
+    time.sleep(5)
+
+    list_result = _nmcli("--terse", "--fields", "SSID", "device", "wifi", "list", "ifname", IFACE, timeout=10,)
+    visible_ssids = {line.strip() for line in list_result.stdout.splitlines() if line.strip()}
+    if ssid not in visible_ssids:
+        log.error("SSID '%s' not visible after rescan. Available: %s", ssid, sorted(visible_ssids)[:10])
+        return False
+
+    log.info("SSID '%s' visible. Connecting...", ssid)
+    r = subprocess.run(
+        [
+            "nmcli",
+            "device", "wifi", "connect", ssid,
+            "password", password,
+            "ifname", IFACE,
+            "name", STA_PROFILE_NAME,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=NM_CMD_TIMEOUT,)
+
+    if r.returncode != 0:
+        log.error("WiFi connect failed: %s", r.stderr.strip())
+        return False
+
+    log.info("Connected to '%s' successfully.", ssid)
+    return True
 
 def _activate_sta_profile() -> bool:
     log.info("Activating STA profile …")
@@ -112,7 +131,7 @@ def _activate_sta_profile() -> bool:
         pass
 
     r = _nmcli(
-        "--timeout", str(CONNECT_TIMEOUT),
+        "--wait", str(CONNECT_TIMEOUT),
         "connection", "up", STA_PROFILE_NAME,
         timeout=CONNECT_TIMEOUT + 5,
     )
